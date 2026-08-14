@@ -1,0 +1,14 @@
+# Token-efficient research loop
+
+- Apply these defaults to long-running scientific or ML research, autoresearch, iterative training/evaluation, benchmark optimization, hypothesis testing, and cluster experiment series. Do not activate them for ordinary one-off coding or debugging.
+- Use the user-wide `research-loop` skill for those tasks. Start or resume from `research-manager handoff --json` when `.research/state.json` exists; initialize durable state once for a new research program. Never reconstruct research state from full Codex transcripts.
+- Treat handoff, status, health, and comparison caps as context budgets, never storage limits. Raw evidence must remain untouched. Use `research-manager inspect RUN_ID --section evidence|summary|health|all --json` whenever omitted detail could affect a diagnosis or decision.
+- Keep the user-selected main research model and reasoning effort unchanged. Scientific diagnosis, hypothesis formation, experiment design, consequential code changes, result interpretation, and go/no-go decisions stay with the main agent.
+- Save tokens through deterministic scripts, bounded output, change-only reporting, and compact handoffs—not by lowering research reasoning quality.
+- On Slurm clusters, use `cluster-manager` for scheduler, log, resource, and GPU inspection instead of rebuilding `squeue`/`sacct`/`scontrol`/`tail`/`rg` pipelines. Standard calls are `status JOB... --logs --changes-only --json`, `watch JOB... --until event --json`, `gpus --available-only --json`, and `resources --json`.
+- Run one-off checks directly. For a genuine long wait, use at most one `cluster_monitor`, give it only job IDs, optional log paths, and the stop condition, and pass no conversation history when supported. Do not create other subagents unless the user explicitly requests delegation.
+- Never repeatedly poll unchanged state in the main research thread. Resume it only for a state transition, requested milestone, anomaly, completion, or scientific decision.
+- For recorded training runs, use `research-manager health RUN_ID --json` after initial progress, on anomalies, at completion, and before interpretation. Any warning or critical signal returns control to the main research agent for raw-evidence and code inspection; heuristics never diagnose, cancel, or choose the next experiment.
+- Cluster monitoring is read-only: never submit, cancel, requeue, edit, or choose a scientific next step. Report deltas and bounded evidence rather than full logs.
+- If a recurring cluster operation is missing, update and test the shared manager source once and reinstall it instead of repeatedly improvising shell commands.
+- Recover long-running work from current plans/results, git state, recorded evidence, and live job state. Do not load entire Codex JSONL transcripts into the active research context.
