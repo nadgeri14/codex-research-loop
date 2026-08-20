@@ -18,6 +18,11 @@ Run manager commands through a non-login shell when available so cluster module 
   runs.jsonl                 append-only event ledger
   decisions.jsonl            append-only scientific decisions
   health/RUN_ID.json         bounded training-health index and progress snapshot
+  monitors/RUN_ID/
+    spec.json                exact wake conditions and configurable invariants
+    state.json               atomic cursors, progress state, dedupe ledger, telemetry
+    events.jsonl             compact structured event ledger
+    wake.json                latest material Sol wake packet, when present
   runs/RUN_ID/
     spec.json                predeclared experiment
     record.json              current operational state
@@ -44,13 +49,15 @@ research-manager template spec
 research-manager plan SPEC.json --json
 research-manager validate RUN_ID --check "CHECK" --evidence PATH --json
 research-manager record-launch RUN_ID --job-id JOB_ID --log PATH --artifact PATH --json
+research-manager arm-monitor RUN_ID --phase TRAINING --target-step STEP \
+  --checkpoint PATH --next-scientific-action "ACTION AFTER WAKE" --json
 research-manager sync [RUN_ID ...] --json
 research-manager health RUN_ID --json
 research-manager transition RUN_ID RUNNING|REDUCING|FAILED|CANCELLED --reason "..." --json
 research-manager template summary
 research-manager record-summary RUN_ID SUMMARY.json --json
 research-manager compare RUN_ID [RUN_ID ...] --json
-research-manager inspect RUN_ID --section all|spec|record|summary|health|evidence --json
+research-manager inspect RUN_ID --section all|spec|record|summary|health|monitor|evidence --json
 research-manager decide RUN_ID --decision DECISION --rationale "..." --next "..." --json
 research-manager checkpoint --strategy "..." --hypothesis "..." --status "..." --next-decision "..." --json
 research-manager status --json
@@ -62,9 +69,19 @@ Decisions are `keep`, `revert`, `refine`, `confirm`, `redirect`, or `stop`.
 
 `sync` makes one compact, read-only call to the shared `cluster-manager`. Use it after a meaningful scheduler transition, not as a conversational polling loop.
 
+`arm-monitor` is the handoff boundary for a long-running operation. It writes an idempotent monitor specification and restart-safe state, records exact wake conditions, and returns a `monitor_command`. Run that command once through the narrow `cluster_monitor`, then end the frontier continuation. The command blocks with `--until wake --timeout 0`; elapsed time and ordinary progress never return control to an LLM.
+
+Invariant and routing thresholds are explicit in `spec.json`. Override defaults at arm time with repeatable `--threshold NAME=VALUE`; supported names are `scheduler_unknown_seconds`, `dedupe_window_seconds`, `metric_window`, `minimum_metric_samples`, `consecutive_violations`, `loss_mad_z`, `gradient_mad_z`, `throughput_ratio`, `step_regression_tolerance`, and `luna_min_confidence`. Step and log stall windows also have the named `--stall-seconds` and `--log-stall-seconds` flags.
+
+The event monitor reads only bytes appended after each log cursor. Each cursor records path, inode, byte offset, modification time, last observed step, and an unfinished final-line fragment. Rotation, truncation, job restart, duplicate lines, and interrupted atomic state writes are handled without rereading the whole log. Expected progress is state only; material events use the explicit taxonomy `MILESTONE`, `CHECKPOINT`, `EVAL_COMPLETED`, `TRAINING_COMPLETED`, `KNOWN_WARNING`, `UNKNOWN_WARNING`, `INVARIANT_FAILED`, `PROCESS_FAILED`, `STALL`, `ARTIFACT_MISSING`, `ARTIFACT_INVALID`, and `SCIENTIFIC_REVIEW_REQUIRED`.
+
+Routing is centralized and deterministic. Routine progress is recorded and monitoring continues. Known operational issues follow their configured deterministic route. A bounded, deduplicated unknown event may return `route: "LUNA"` with a strict response schema; validate the answer using `cluster-manager resolve-luna`. A routine classification returns to monitoring, while an invalid, low-confidence, `FRONTIER_REQUIRED`, or scientifically significant result emits one compact Sol wake packet. Luna never chooses a scientific action.
+
+Monitor telemetry includes deterministic poll count, incrementally read bytes, emitted and deduplicated events, Luna calls and token counts when supplied, Sol wakeups, no-change frontier wakeups, whole-log reads, and handoff bytes. The invariants are `frontier_no_change_wakeups == 0` and `full_log_reads == 0` during monitoring.
+
 `health` scans up to the last 4 MiB of every recorded log by default. It detects explicit exceptions and training failures, parses steps/loss/gradient norms/throughput, warns about stalled progress and relative spikes or collapse, and stores a small progress snapshot for the next check. Use `--tail-bytes` up to 16 MiB or change `--stale-seconds` when a workload has unusually sparse logging. Warnings and critical signals require main-agent review; the command never cancels a run or makes a scientific decision.
 
-`inspect` bypasses conversational reductions for stored structured state. `--section evidence` returns every registered evidence path with existence, size, and modification time without reading file contents. `--section all` returns the complete stored spec, record, summary, health report, and evidence manifest. Read raw files directly when those structures point to evidence needed for a diagnosis.
+`inspect` bypasses conversational reductions for stored structured state. `--section monitor` returns the monitor spec, compact state, and current wake packet without reading the event ledger or raw log. `--section evidence` returns every registered evidence path with existence, size, and modification time without reading file contents. `--section all` returns the complete stored spec, record, summary, health report, monitor index, and evidence manifest. Read raw files directly when those structures point to evidence needed for a diagnosis.
 
 ## Experiment spec
 
@@ -122,6 +139,7 @@ Generate the current template with `research-manager template summary`. Required
 - JSON ledgers are tailed from a bounded byte window rather than loaded wholesale.
 - `compare` accepts at most twenty runs, caps output at 64 KiB, and aligns numeric values without interpreting them.
 - `health` is capped at 64 KiB and retains every raw log untouched.
+- event-monitor Luna packets contain only compact state, one exact new event, a bounded evidence window, and the response contract;
 - `doctor` validates schemas and reports a bounded set of missing local evidence paths without opening evidence contents.
 
 These are context budgets, not storage limits. Omitted fields are counted, all stored structured state is available through `inspect`, and all raw evidence remains at its registered paths. If a bounded result is insufficient for a scientific decision, retrieve the relevant section and inspect the raw evidence directly.

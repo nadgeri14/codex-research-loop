@@ -64,7 +64,7 @@ class ClusterManagerTests(unittest.TestCase):
         self.assertFalse(jobs[0].failed)
         self.assertEqual([call[0] for call in runner.calls], ["squeue", "sacct"])
 
-    def test_log_scan_is_delta_only_and_detects_milestones(self) -> None:
+    def test_log_scan_is_delta_only_and_keeps_progress_non_material(self) -> None:
         log = self.tmp_path / "run_64001.log"
         log.write_text("startup\ntraining_step: 1\n")
         milestones = cm.compile_patterns(cm.DEFAULT_MILESTONE_PATTERNS, [])
@@ -78,7 +78,8 @@ class ClusterManagerTests(unittest.TestCase):
             milestone_patterns=milestones,
             error_patterns=errors,
         )
-        self.assertEqual(first["milestones"], ["training_step: 1"])
+        self.assertNotIn("milestones", first)
+        self.assertEqual(first["progress"]["last_step"], 1)
 
         with log.open("a") as handle:
             handle.write("ordinary progress\ntraining_step: 2\n")
@@ -90,8 +91,8 @@ class ClusterManagerTests(unittest.TestCase):
             milestone_patterns=milestones,
             error_patterns=errors,
         )
-        self.assertEqual(second["milestones"], ["training_step: 2"])
-        self.assertNotIn("training_step: 1", "\n".join(second["milestones"]))
+        self.assertNotIn("milestones", second)
+        self.assertEqual(second["progress"]["last_step"], 2)
 
         with log.open("a") as handle:
             handle.write("training_step: 2\n")
@@ -104,6 +105,27 @@ class ClusterManagerTests(unittest.TestCase):
             error_patterns=errors,
         )
         self.assertNotIn("milestones", third)
+        self.assertEqual(third["progress"]["last_step"], 2)
+
+    def test_milestone_only_regex_replaces_noisy_default_progress_patterns(self) -> None:
+        args = cm.build_parser().parse_args(
+            [
+                "watch",
+                "64001",
+                "--milestone-only-regex",
+                r"training_step:\s*30\b",
+            ]
+        )
+        patterns = cm.compile_patterns(
+            args.milestone_only_regex or cm.DEFAULT_MILESTONE_PATTERNS,
+            args.milestone_regex,
+        )
+        matches = cm.matching_lines(
+            ["training_step: 11", "training_step: 30", "training_step: 31"],
+            patterns,
+            limit=10,
+        )
+        self.assertEqual(matches, ["training_step: 30"])
 
     def test_report_suppresses_unchanged_scheduler_and_log_state(self) -> None:
         log = self.tmp_path / "run_64001.log"
@@ -127,6 +149,64 @@ class ClusterManagerTests(unittest.TestCase):
         self.assertTrue(first["changed"])
         self.assertFalse(second["changed"])
         self.assertEqual(second["jobs"][0]["log"]["new_bytes"], 0)
+
+    def test_explicit_log_monitoring_survives_controller_outage(self) -> None:
+        log = self.tmp_path / "run_64001.log"
+        log.write_text("startup\ntraining_step: 1\n")
+        runner = FakeRunner(
+            {
+                "squeue": (
+                    1,
+                    "",
+                    "slurm_load_jobs error: Unable to contact slurm controller",
+                )
+            }
+        )
+        report, _ = cm.build_report(
+            ["64001"],
+            user="alice",
+            cwd=self.tmp_path,
+            state={"schema": 1, "jobs": {}},
+            scan_logs=True,
+            explicit_logs={"64001": log},
+            auto_log=False,
+            max_log_bytes=10_000,
+            milestone_patterns=cm.compile_patterns(cm.DEFAULT_MILESTONE_PATTERNS, []),
+            error_patterns=cm.compile_patterns(cm.DEFAULT_ERROR_PATTERNS, []),
+            runner=runner,
+        )
+        self.assertEqual(report["jobs"][0]["state"], "UNKNOWN")
+        self.assertEqual(report["jobs"][0]["source"], "log_only")
+        self.assertNotIn("milestones", report["jobs"][0]["log"])
+        self.assertEqual(report["jobs"][0]["log"]["progress"]["last_step"], 1)
+        self.assertTrue(
+            any("monitoring explicitly bound logs only" in warning for warning in report["warnings"])
+        )
+
+    def test_controller_outage_without_explicit_log_still_fails(self) -> None:
+        runner = FakeRunner(
+            {
+                "squeue": (
+                    1,
+                    "",
+                    "slurm_load_jobs error: Unable to contact slurm controller",
+                )
+            }
+        )
+        with self.assertRaisesRegex(cm.ClusterManagerError, "Unable to contact"):
+            cm.build_report(
+                ["64001"],
+                user="alice",
+                cwd=self.tmp_path,
+                state={"schema": 1, "jobs": {}},
+                scan_logs=True,
+                explicit_logs={},
+                auto_log=False,
+                max_log_bytes=10_000,
+                milestone_patterns=cm.compile_patterns(cm.DEFAULT_MILESTONE_PATTERNS, []),
+                error_patterns=cm.compile_patterns(cm.DEFAULT_ERROR_PATTERNS, []),
+                runner=runner,
+            )
 
     def test_failed_job_is_an_anomaly(self) -> None:
         runner = FakeRunner(

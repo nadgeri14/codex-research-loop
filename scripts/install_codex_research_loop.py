@@ -24,6 +24,9 @@ LEGACY_POLICY_HEADINGS = (
     "# Token-efficient research loop",
 )
 
+OBSOLETE_AGENT = "research-implementer-luna.toml"
+OBSOLETE_LABEL = f"retire:{OBSOLETE_AGENT}"
+
 
 class InstallError(RuntimeError):
     """A concise, user-facing installation error."""
@@ -141,14 +144,18 @@ def build_targets(
                 )
             )
 
-    targets.append(
-        Target(
-            "agent/cluster-monitor.toml",
-            codex_home / "agents" / "cluster-monitor.toml",
-            require_file(package_root / "agents" / "cluster-monitor.toml"),
-            0o644,
+    agent_sources = sorted((package_root / "agents").glob("*.toml"))
+    if not agent_sources:
+        raise InstallError(f"missing packaged agent definitions: {package_root / 'agents'}")
+    for source in agent_sources:
+        targets.append(
+            Target(
+                f"agent/{source.name}",
+                codex_home / "agents" / source.name,
+                require_file(source),
+                0o644,
+            )
         )
-    )
 
     agents_path = codex_home / "AGENTS.md"
     if agents_path.is_symlink():
@@ -223,26 +230,44 @@ def install_targets(
 ) -> dict[str, object]:
     actions = [(target, target_action(target)) for target in targets]
     changed = [(target, action) for target, action in actions if action != "unchanged"]
+    obsolete_path = codex_home / "agents" / OBSOLETE_AGENT
+    retirement_needed = False
+    if obsolete_path.is_symlink():
+        raise InstallError(f"refusing to replace symlinked target: {obsolete_path}")
+    elif obsolete_path.exists():
+        if not obsolete_path.is_file():
+            raise InstallError(f"installation target is not a regular file: {obsolete_path}")
+        retirement_needed = True
+
+    reported_changed = [
+        {"label": target.label, "action": action, "path": str(target.destination)}
+        for target, action in changed
+    ]
+    if retirement_needed:
+        reported_changed.append(
+            {"label": OBSOLETE_LABEL, "action": "remove", "path": str(obsolete_path)}
+        )
+
     result: dict[str, object] = {
         "schema": 1,
-        "status": "dry-run" if dry_run else ("installed" if changed else "up-to-date"),
-        "changed": [
-            {"label": target.label, "action": action, "path": str(target.destination)}
-            for target, action in changed
-        ],
+        "status": "dry-run" if dry_run else ("installed" if (changed or retirement_needed) else "up-to-date"),
+        "changed": reported_changed,
         "unchanged": [
             str(target.destination) for target, action in actions if action == "unchanged"
         ],
         "backup_dir": None,
+        "retired": [str(obsolete_path)] if retirement_needed else [],
+        "removed": [],
     }
-    if dry_run or not changed:
+    if dry_run or (not changed and not retirement_needed):
         return result
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup_dir = codex_home / "backups" / "research-loop" / f"{timestamp}-{os.getpid()}"
     existing = [(target, action) for target, action in changed if action == "update"]
     manifest_entries: list[dict[str, object]] = []
-    if existing:
+    needs_backup = bool(existing or retirement_needed)
+    if needs_backup:
         backup_dir.mkdir(parents=True, exist_ok=False)
         for index, (target, _) in enumerate(existing, start=1):
             backup_path = backup_dir / safe_backup_label(index, target.label)
@@ -257,6 +282,20 @@ def install_targets(
                     "mode": stat.S_IMODE(target.destination.stat().st_mode),
                 }
             )
+        if retirement_needed:
+            backup_index = len(existing) + 1
+            backup_path = backup_dir / safe_backup_label(backup_index, OBSOLETE_LABEL)
+            try:
+                shutil.copy2(obsolete_path, backup_path)
+            except OSError as exc:
+                raise InstallError(f"cannot back up {obsolete_path}: {exc}") from exc
+            manifest_entries.append(
+                {
+                    "original": str(obsolete_path),
+                    "backup": str(backup_path),
+                    "mode": stat.S_IMODE(obsolete_path.stat().st_mode),
+                }
+            )
         atomic_write(
             backup_dir / "manifest.json",
             (json.dumps({"files": manifest_entries}, indent=2, sort_keys=True) + "\n").encode(),
@@ -269,6 +308,14 @@ def install_targets(
             atomic_write(target.destination, target.content, target.mode)
     except OSError as exc:
         raise InstallError(f"cannot install {target.destination}: {exc}") from exc
+
+    if retirement_needed:
+        try:
+            obsolete_path.unlink()
+        except OSError as exc:
+            raise InstallError(f"cannot remove obsolete agent {obsolete_path}: {exc}") from exc
+        result["removed"] = [str(obsolete_path)]
+
     return result
 
 

@@ -5,7 +5,7 @@ description: Use for long-running scientific or ML research, autoresearch, itera
 
 # Research Loop
 
-Preserve research quality by keeping scientific judgment with the selected main model and moving only deterministic bookkeeping, scheduler observation, and result alignment into scripts. Treat compact summaries as indexes to raw evidence, never as replacements for it.
+Preserve research quality by keeping scientific judgment, research planning, and decisions on GPT-5.6-Sol at `xhigh`; moving routine code, configuration, and test review to GPT-5.6-Sol at `high` read-only; moving execution-ready implementation to Meta Muse Spark (`muse-spark-1.2-contributor` at `xhigh`); and keeping routine cluster observation on deterministic tools or Luna-low. Treat compact summaries as indexes to raw evidence, never as replacements for it.
 
 ## Start or resume
 
@@ -27,27 +27,70 @@ Preserve research quality by keeping scientific judgment with the selected main 
 4. Recover from the handoff, current code, recorded evidence paths, and live job state. Do not load full Codex transcripts or entire historical logs into the active context.
 5. Read [references/research-manager.md](references/research-manager.md) when exact command or JSON-schema details are needed.
 
-## Keep the quality boundary
+## Route work by reasoning role
 
-The main research agent owns all work that benefits from frontier reasoning:
+### Sol xhigh leads research
+
+Use `gpt-5.6-sol` at `xhigh` for the main research thread and the configured `research_lead` agent. Preserve that model and effort for the hardest research problems; do not silently lower either one to save tokens.
+
+Sol owns work that benefits from frontier research reasoning:
 
 - scientific diagnosis and literature-grounded understanding;
 - hypothesis formation and falsification criteria;
 - baseline, treatment, metric, dataset, seed, and evaluation design;
-- consequential research code or configuration changes;
+- research strategy, experiment plans, and implementation specifications (the implementation contract);
 - interpretation of results and anomalies;
 - keep, revert, refine, confirm, redirect, and stop decisions.
 
-Do not lower the user's main model or reasoning effort for those steps. Do not delegate scientific judgment to the cluster monitor, `research-manager`, `cluster-manager`, or a cheaper model.
+Sol creates the implementation contract and does not directly implement research code, configuration, or test changes, including tiny changes, does not perform routine review of Muse diffs and validation reports, and does not inspect raw code or implementation details. When an implementation detail could affect a research decision, the reviewer provides a bounded, exact implementation-evidence handoff (with file/line references and the relevant behavior) so Sol can resolve only the scientific question or revise the contract without reviewing code. If the Muse Spark implementation path is unavailable or fails, stop and report the limitation; do not substitute Sol, Luna, Spark from another provider, or another model. Do not delegate scientific judgment to an implementation worker, cluster observer, `research-manager`, or `cluster-manager`.
+
+### research_code_reviewer (Sol high, read-only) reviews implementation
+
+Use `gpt-5.6-sol` at `high` with a `read-only` sandbox for the configured `research_code_reviewer` agent. It reviews every Muse diff and validation report against the Sol-xhigh implementation contract before a consequential launch or scientific conclusion.
+
+- review-only: findings first, exact file/line references, correctness/regression/edge-case/test-coverage focus; assess test and validation evidence for implementation correctness;
+- no edits and no new scientific decisions; do not interpret scientific experiment results;
+- an unfavorable review produces a bounded correction request back to Muse for reimplementation; neither Sol-xhigh nor the reviewer patches the implementation itself;
+- a scientific ambiguity is returned to the Sol-xhigh research lead with a bounded, exact implementation-evidence handoff (with file/line references and the relevant behavior) so the lead can resolve only the scientific question or revise the contract without reviewing code; Muse then reimplements and the reviewer reviews again;
+- a favorable review produces a bounded review verdict/evidence handoff (with exact file/line references, how it aligns with the contract, residual risks, and validation evidence) to the Sol-xhigh research lead, which then owns launch/go-no-go and interpretation without duplicating routine review and without inspecting raw code.
+
+The research lead does not inspect raw code or implementation details. When an implementation detail could affect a research decision, the reviewer provides a bounded, exact implementation-evidence handoff (with file/line references and the relevant behavior) so the lead can resolve only the scientific question or revise the contract without reviewing code. The reviewer may and must assess test and validation evidence for implementation correctness, but it must not interpret scientific experiment results or make scientific decisions.
+
+### Muse Spark implements — sole implementation worker
+
+After Sol defines the intended behavior, file ownership, constraints, and validation criteria, delegate all bounded execution-ready implementation to Meta Muse Spark (`muse-spark-1.2-contributor` at `xhigh`) via the locally installed Muse CLI. Muse is the only model allowed to implement research code, configuration, or test changes. Read [references/muse-spark.md](references/muse-spark.md) before invoking it.
+
+- let Muse inspect the code needed for its task, edit only its assigned scope, and run focused checks;
+- have the Sol-high read-only reviewer inspect every resulting diff and validation evidence against the contract before a consequential launch; an unfavorable review must produce a bounded correction request sent back to Muse, and neither Sol-xhigh nor the reviewer patches the implementation itself; a scientific ambiguity returns to Sol-xhigh with a bounded, exact implementation-evidence handoff (with file/line references and the relevant behavior) for contract revision and the cycle repeats; a favorable review hands a bounded verdict (with exact file/line references and validation evidence) to Sol-xhigh, which owns launch/go-no-go without duplicating routine review and without inspecting raw code;
+- if Muse is unavailable or fails, stop and report the limitation; do not substitute Sol, Luna, Spark from another provider, or another model.
+
+Do not assign overlapping files to concurrent implementation workers. If Muse encounters a scientific ambiguity, conflicting evidence, or a design choice that could change the experiment, it must stop at the boundary and return the question to Sol.
+
+### Deterministic tools and Luna-low observe operations
 
 Use deterministic tools for mechanical work:
 
 - `research-manager` validates schemas, records state, synchronizes job states, aligns metrics, and emits bounded handoffs;
 - `research-manager health RUN_ID --json` scans recorded logs for non-finite values, instability, stalled progress, throughput collapse, distributed/data/checkpoint failures, and other bounded health signals;
 - `cluster-manager` reads Slurm, resource, GPU, and bounded log deltas, returning control when common training failures appear;
-- the configured `cluster_monitor` may wait for a genuine long-running job, but it receives only job IDs, optional log paths, and a stop condition.
+- the configured `cluster_monitor` may own one genuine long wait, but it receives only the exact armed monitor command and later any bounded ambiguous-event packet.
 
-Use scripts directly when they suffice. Do not create an agent merely to run a command or poll state.
+For a bounded one-off request such as “is the job still running smoothly?”, use the configured Luna-low `cluster_checker`. Give it only the relevant run IDs, process names, and bounded log paths. It may report scheduler/process/GPU/log health, but it must not diagnose scientific meaning, change experiments, or continue polling. Material anomalies return to Sol xhigh.
+
+Use scripts directly for deterministic bookkeeping. Do not use Sol to tail logs, list processes, check routine scheduler state, or wait for a job.
+
+## Suspend instead of waiting
+
+Never use an LLM to wait for a deterministic external condition. After launching a long-running operation:
+
+1. Persist its exact wake conditions with `research-manager arm-monitor RUN_ID ... --json`.
+2. Give the returned blocking command to one `cluster_monitor` with no conversation history.
+3. End the frontier continuation immediately. Do not call `wait_agent`, `list_agents`, repeat handoffs, or emit a status update merely because time passed.
+4. Resume frontier reasoning only from the compact wake packet under `.research/monitors/RUN_ID/`.
+
+The blocking `cluster-manager watch --until wake --timeout 0` process is Level 0. It owns scheduler polling, restart-safe log cursors, milestone detection, invariant checks, deduplication, and sleeping through ordinary progress without producing an assistant turn. Never use `--no-state`, `--emit-initial`, or a finite timeout for a long-running event monitor.
+
+The Luna-low `cluster_monitor` is Level 1 only when the deterministic router emits `route: "LUNA"`. Give it only the bounded event packet, validate its structured classification with `cluster-manager resolve-luna`, and return to Level 0 when it classifies the event as routine. Luna must not make scientific decisions. Completion, scientific anomalies, and any `route: "SOL"` wake packet return to Sol xhigh at Level 2.
 
 ## Run one evidence-preserving iteration
 
@@ -65,7 +108,7 @@ Create a spec from `research-manager template spec`, then register it with `rese
 
 ### 2. Implement and validate
 
-Use the main agent to inspect and change the scientific code. Run focused unit, integration, and smoke checks appropriate to the risk. Record the checks actually completed:
+Have Sol-xhigh write the implementation contract, then delegate all execution-ready code, configuration, and test changes to Muse Spark (`muse-spark-1.2-contributor` at `xhigh`). The Sol-high read-only reviewer reviews every resulting diff and validation report against the contract before launch; an unfavorable review must produce a bounded correction request sent back to Muse and neither Sol-xhigh nor the reviewer patches the implementation itself; a scientific ambiguity is returned to Sol-xhigh with a bounded, exact implementation-evidence handoff (with file/line references and the relevant behavior) for contract revision and the cycle repeats; a favorable review produces a bounded verdict/evidence handoff (with exact file/line references and validation evidence) to Sol-xhigh, which owns launch/go-no-go without duplicating routine review and without inspecting raw code. If Muse is unavailable or fails, stop and report the limitation without substituting Sol, Luna, Spark from another provider, or another model. Run focused unit, integration, and smoke checks appropriate to the risk. Record the checks actually completed:
 
 ```bash
 research-manager validate RUN_ID --check "CHECK" --evidence PATH --json
@@ -83,13 +126,22 @@ research-manager record-launch RUN_ID --job-id JOB_ID --log LOG_PATH --artifact 
 
 Do not repeatedly reconstruct `sbatch`, `squeue`, `sacct`, `scontrol`, `tail`, or log-search pipelines in conversation. If a generic operation is missing, improve the shared manager once and test it.
 
+Arm the deterministic monitor immediately after recording the launch. Include only material wake conditions and the next scientific action:
+
+```bash
+research-manager arm-monitor RUN_ID --phase TRAINING --target-step TARGET \
+  --checkpoint PATH --next-scientific-action "Interpret the completed milestone" --json
+```
+
+Pass the returned `monitor_command` unchanged to `cluster_monitor`, then stop the main continuation.
+
 ### 4. Wait outside the reasoning loop
 
-For a one-off check, use `research-manager sync RUN_ID --json` or one compact `cluster-manager status` call. For a genuine wait, use one `cluster_monitor` with `cluster-manager watch`; resume the main research agent only for a state change, milestone, anomaly, completion, user request, or scientific decision.
+For a one-off check, delegate to Luna-low `cluster_checker`, which should use one read-only `research-manager status --json` call or `cluster-manager status JOB_ID --no-state --logs --json` with bounded log bytes. For a genuine wait, use the armed event monitor and resume Sol only for a material wake packet, user request, or scientific decision. Ordinary steps, loss updates, log growth, an unchanged running state, and elapsed time are not wake conditions.
 
-Never poll unchanged state in the main thread. Never feed routine elapsed-time updates or duplicate log tails back into the scientific context.
+Never poll unchanged state in the main thread. Never feed routine elapsed-time updates or duplicate log tails back into the scientific context. A finite watch timeout is an operational error, not a reason to resume the frontier agent.
 
-Run `research-manager health RUN_ID --json` after the first meaningful training progress, on a reported anomaly, at completion, and before interpreting results. A warning or critical signal must return control to the main agent. Treat health checks as triage, not proof: inspect the cited raw log and relevant code before diagnosing, canceling, or changing the experiment.
+Run `research-manager health RUN_ID --json` after the first meaningful training progress, on a reported anomaly, at completion, and before interpreting results. A warning or critical signal must return control to Sol xhigh. Treat health checks as triage, not proof: inspect the cited raw log and relevant code before diagnosing, canceling, or changing the experiment.
 
 ### 5. Reduce before interpreting
 
@@ -106,7 +158,7 @@ Use deterministic project code to reduce raw outputs into a bounded summary. Inc
 
 Record the summary with `research-manager record-summary RUN_ID SUMMARY.json --json`. Keep raw evidence intact at the referenced paths.
 
-### 6. Interpret with frontier reasoning
+### 6. Interpret with Sol xhigh
 
 Use `research-manager compare RUN_ID... --json` only to align measurements. It does not choose a winner. The main agent must inspect the raw evidence when:
 

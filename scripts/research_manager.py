@@ -12,7 +12,8 @@ Typical flow::
     research-manager plan experiment.json
     research-manager validate exp-001 --check "unit tests passed" --evidence reports/tests.txt
     research-manager record-launch exp-001 --job-id 64001 --log logs/exp-001.log
-    research-manager sync exp-001
+    research-manager arm-monitor exp-001 --phase TRAINING --target-step 200000 \
+        --next-scientific-action "reduce and audit"
     research-manager record-summary exp-001 summary.json
     research-manager compare exp-001 --json
     research-manager decide exp-001 --decision refine --rationale "..." --next "..."
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -56,6 +58,27 @@ MAX_RECENT_RUNS = 32
 MAX_LEDGER_TAIL_BYTES = 262_144
 MAX_DIAGNOSTICS = 100
 MAX_SYNC_RUNS = 128
+
+MONITOR_THRESHOLD_DEFAULTS: dict[str, float | int] = {
+    "stall_seconds": 1_800.0,
+    "log_stall_seconds": 1_800.0,
+    "scheduler_unknown_seconds": 300.0,
+    "dedupe_window_seconds": 21_600.0,
+    "metric_window": 31,
+    "minimum_metric_samples": 7,
+    "consecutive_violations": 3,
+    "loss_mad_z": 12.0,
+    "gradient_mad_z": 12.0,
+    "throughput_ratio": 0.10,
+    "step_regression_tolerance": 1,
+    "luna_min_confidence": 0.80,
+}
+MONITOR_INTEGER_THRESHOLDS = {
+    "metric_window",
+    "minimum_metric_samples",
+    "consecutive_violations",
+    "step_regression_tolerance",
+}
 
 TRAINING_SIGNAL_PATTERNS = (
     (
@@ -254,6 +277,26 @@ def health_path(root: Path, run_id: str) -> Path:
     return research_dir(root) / "health" / f"{validate_run_id(run_id)}.json"
 
 
+def monitor_dir(root: Path, run_id: str) -> Path:
+    return research_dir(root) / "monitors" / validate_run_id(run_id)
+
+
+def monitor_spec_path(root: Path, run_id: str) -> Path:
+    return monitor_dir(root, run_id) / "spec.json"
+
+
+def monitor_state_path(root: Path, run_id: str) -> Path:
+    return monitor_dir(root, run_id) / "state.json"
+
+
+def monitor_events_path(root: Path, run_id: str) -> Path:
+    return monitor_dir(root, run_id) / "events.jsonl"
+
+
+def monitor_wake_path(root: Path, run_id: str) -> Path:
+    return monitor_dir(root, run_id) / "wake.json"
+
+
 def validate_run_id(run_id: str) -> str:
     if run_id in {".", ".."} or not RUN_ID_RE.fullmatch(run_id):
         raise ResearchManagerError(
@@ -355,8 +398,17 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(compact_json(value) + "\n", encoding="utf-8")
+        encoded = (compact_json(value) + "\n").encode("utf-8")
+        with temporary.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except OSError as exc:
         with contextlib.suppress(OSError):
             temporary.unlink()
@@ -751,6 +803,331 @@ def record_launch(
         state["next_decision"] = f"wait for a state change in {run_id}; do not poll unchanged state"
         save_state(root, state)
         return compact_run(root, record, include_summary=False)
+
+
+def _monitor_fingerprint(spec: dict[str, Any]) -> str:
+    return hashlib.sha256(compact_json(spec).encode("utf-8")).hexdigest()
+
+
+def _monitor_bootstrap_state(spec: dict[str, Any], *, handoff_bytes: int) -> dict[str, Any]:
+    now_epoch = time.time()
+    now = datetime.fromtimestamp(now_epoch, timezone.utc).replace(microsecond=0).isoformat()
+    return {
+        "schema": 2,
+        "experiment_id": spec["experiment_id"],
+        "spec_sha256": _monitor_fingerprint(spec),
+        "phase": spec["phase"],
+        "scheduler_status": "UNKNOWN",
+        "last_step": None,
+        "target_step": spec.get("target_step"),
+        "last_checkpoint": None,
+        "last_loss": None,
+        "warnings": [],
+        "pending_evaluations": [],
+        "wake_conditions": spec["wake_conditions"],
+        "jobs": {},
+        "artifacts": {},
+        "processes": {},
+        "dedupe": {},
+        "once_events": {},
+        "pending_luna": None,
+        "last_luna_resolution": None,
+        "last_wake": None,
+        "started_at": now,
+        "started_at_epoch": now_epoch,
+        "updated_at": now,
+        "telemetry": {
+            "monitor_poll_count": 0,
+            "bytes_read_incrementally": 0,
+            "events_emitted": 0,
+            "events_deduplicated": 0,
+            "luna_invocations": 0,
+            "luna_input_tokens": 0,
+            "luna_output_tokens": 0,
+            "sol_wakeups": 0,
+            "frontier_no_change_wakeups": 0,
+            "full_log_reads": 0,
+            "handoff_bytes": handoff_bytes,
+        },
+    }
+
+
+def monitor_thresholds(overrides: dict[str, float | int] | None = None) -> dict[str, float | int]:
+    values = dict(MONITOR_THRESHOLD_DEFAULTS)
+    for key, value in (overrides or {}).items():
+        if key not in values:
+            raise ResearchManagerError(f"unknown monitor threshold: {key}")
+        default = values[key]
+        if isinstance(default, int):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ResearchManagerError(f"monitor threshold {key} must be a non-negative integer")
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ResearchManagerError(f"monitor threshold {key} must be a finite non-negative number")
+        values[key] = value
+    if int(values["metric_window"]) < 5:
+        raise ResearchManagerError("monitor threshold metric_window must be at least 5")
+    if int(values["minimum_metric_samples"]) < 3:
+        raise ResearchManagerError("monitor threshold minimum_metric_samples must be at least 3")
+    if int(values["consecutive_violations"]) < 1:
+        raise ResearchManagerError("monitor threshold consecutive_violations must be at least 1")
+    for key in ("throughput_ratio", "luna_min_confidence"):
+        if not 0 <= float(values[key]) <= 1:
+            raise ResearchManagerError(f"monitor threshold {key} must be between 0 and 1")
+    return values
+
+
+def parse_monitor_threshold_args(values: Sequence[str]) -> dict[str, float | int]:
+    parsed: dict[str, float | int] = {}
+    for raw in values:
+        if "=" not in raw:
+            raise ResearchManagerError("--threshold requires NAME=VALUE")
+        key, raw_value = (item.strip() for item in raw.split("=", 1))
+        if key not in MONITOR_THRESHOLD_DEFAULTS:
+            raise ResearchManagerError(f"unknown monitor threshold: {key}")
+        try:
+            value: float | int
+            value = int(raw_value) if key in MONITOR_INTEGER_THRESHOLDS else float(raw_value)
+        except ValueError as exc:
+            raise ResearchManagerError(f"invalid value for monitor threshold {key}: {raw_value!r}") from exc
+        parsed[key] = value
+    monitor_thresholds(parsed)
+    return parsed
+
+
+def arm_monitor(
+    root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    target_step: int | None,
+    checkpoint_paths: Sequence[str],
+    evaluation_complete_paths: Sequence[str],
+    training_complete_paths: Sequence[str],
+    known_warning_regex: Sequence[str],
+    scientific_event_regex: Sequence[str],
+    stall_seconds: float,
+    log_stall_seconds: float,
+    next_scientific_action: str,
+    cluster_manager: str,
+    threshold_overrides: dict[str, float | int] | None = None,
+) -> dict[str, Any]:
+    run_id = validate_run_id(run_id)
+    normalized_phase = require_text(phase, "monitor phase", maximum=32).upper()
+    if normalized_phase not in {"TRAINING", "EVALUATION", "REDUCTION", "OTHER"}:
+        raise ResearchManagerError("monitor phase must be TRAINING, EVALUATION, REDUCTION, or OTHER")
+    if target_step is not None and (
+        isinstance(target_step, bool) or not isinstance(target_step, int) or target_step < 0
+    ):
+        raise ResearchManagerError("target step must be a non-negative integer")
+    for label, value in (("stall seconds", stall_seconds), ("log stall seconds", log_stall_seconds)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ResearchManagerError(f"{label} must be finite and non-negative")
+    next_action = require_text(next_scientific_action, "next scientific action", maximum=2_000)
+    manager = require_text(cluster_manager, "cluster-manager executable", maximum=MAX_PATH_TEXT)
+    thresholds = monitor_thresholds(
+        {
+            **(threshold_overrides or {}),
+            "stall_seconds": stall_seconds,
+            "log_stall_seconds": log_stall_seconds,
+        }
+    )
+    checkpoints = list(
+        dict.fromkeys(require_text(item, "checkpoint path", maximum=MAX_PATH_TEXT) for item in checkpoint_paths)
+    )
+    evaluation_paths = list(
+        dict.fromkeys(
+            require_text(item, "evaluation completion path", maximum=MAX_PATH_TEXT)
+            for item in evaluation_complete_paths
+        )
+    )
+    training_paths = list(
+        dict.fromkeys(
+            require_text(item, "training completion path", maximum=MAX_PATH_TEXT)
+            for item in training_complete_paths
+        )
+    )
+    known_regex = list(dict.fromkeys(require_text(item, "known warning regex", maximum=2_000) for item in known_warning_regex))
+    scientific_regex = list(
+        dict.fromkeys(require_text(item, "scientific event regex", maximum=2_000) for item in scientific_event_regex)
+    )
+    for field, items in (
+        ("checkpoint paths", checkpoints),
+        ("evaluation completion paths", evaluation_paths),
+        ("training completion paths", training_paths),
+        ("known warning regexes", known_regex),
+        ("scientific event regexes", scientific_regex),
+    ):
+        if len(items) > MAX_LIST_ITEMS:
+            raise ResearchManagerError(f"{field} contains more than {MAX_LIST_ITEMS} items")
+    for field, expressions in (("known warning", known_regex), ("scientific event", scientific_regex)):
+        for expression in expressions:
+            try:
+                re.compile(expression, re.IGNORECASE)
+            except re.error as exc:
+                raise ResearchManagerError(f"invalid {field} regex {expression!r}: {exc}") from exc
+
+    with locked(root):
+        research_state = load_state(root)
+        record = load_record(root, run_id)
+        if record["status"] not in {"QUEUED", "RUNNING", "REDUCING"}:
+            raise ResearchManagerError(
+                f"run {run_id} must be QUEUED, RUNNING, or REDUCING before arming a monitor"
+            )
+        jobs = list(record.get("job_ids", []))
+        if not jobs:
+            raise ResearchManagerError(f"run {run_id} has no recorded Slurm job IDs")
+        logs = list(record.get("log_paths", []))
+        log_bindings: dict[str, str] = {}
+        if len(logs) == len(jobs):
+            log_bindings = dict(zip(jobs, logs, strict=True))
+        elif logs:
+            log_bindings[jobs[0]] = logs[0]
+
+        wake_conditions = ["any Slurm job exits", "known invariant fails", "unknown non-deduplicated warning occurs"]
+        if target_step is not None:
+            wake_conditions.append(f"step >= {target_step}")
+        wake_conditions.extend(f"checkpoint appears: {path}" for path in checkpoints)
+        wake_conditions.extend(f"evaluation completion artifact appears: {path}" for path in evaluation_paths)
+        wake_conditions.extend(f"training completion artifact appears: {path}" for path in training_paths)
+        artifacts = [
+            {
+                "path": path,
+                "kind": "checkpoint",
+                "wake_on_create": True,
+                "required_when": "target_step" if target_step is not None else "never",
+                "sha256": "",
+            }
+            for path in checkpoints
+        ]
+        artifacts.extend(
+            {
+                "path": path,
+                "kind": "evaluation_complete",
+                "wake_on_create": True,
+                "required_when": "terminal",
+                "sha256": "",
+            }
+            for path in evaluation_paths
+        )
+        artifacts.extend(
+            {
+                "path": path,
+                "kind": "training_complete",
+                "wake_on_create": True,
+                "required_when": "terminal",
+                "sha256": "",
+            }
+            for path in training_paths
+        )
+        spec = {
+            "schema": 1,
+            "experiment_id": run_id,
+            "phase": normalized_phase,
+            "job_ids": jobs,
+            "log_bindings": log_bindings,
+            "target_step": target_step,
+            "wake_conditions": wake_conditions,
+            "next_scientific_action": next_action,
+            "thresholds": thresholds,
+            "artifacts": artifacts,
+            "processes": [],
+            "known_warning_regex": known_regex,
+            "unknown_warning_regex": [],
+            "training_complete_regex": [],
+            "evaluation_complete_regex": [],
+            "scientific_event_regex": scientific_regex,
+            "luna_max_input_bytes": 16_384,
+            "event_log_path": display_evidence_path(monitor_events_path(root, run_id), root),
+            "wake_file": display_evidence_path(monitor_wake_path(root, run_id), root),
+        }
+        spec_path = monitor_spec_path(root, run_id)
+        state_path_value = monitor_state_path(root, run_id)
+        spec_already_present = spec_path.exists()
+        if spec_path.exists():
+            existing_spec = read_json(spec_path, label="monitor specification")
+            if existing_spec != spec:
+                raise ResearchManagerError(
+                    f"monitor for {run_id} is already armed with a different specification"
+                )
+        else:
+            atomic_write_json(spec_path, spec)
+
+        command = [
+            manager,
+            "watch",
+            *jobs,
+            "--monitor-spec",
+            str(spec_path),
+            "--state-file",
+            str(state_path_value),
+            "--until",
+            "wake",
+            "--timeout",
+            "0",
+            "--json",
+        ]
+        monitor_record = {
+            "status": "ARMED",
+            "phase": normalized_phase,
+            "spec_path": display_evidence_path(spec_path, root),
+            "state_path": display_evidence_path(state_path_value, root),
+            "event_log_path": display_evidence_path(monitor_events_path(root, run_id), root),
+            "wake_file": display_evidence_path(monitor_wake_path(root, run_id), root),
+            "wake_conditions": wake_conditions,
+            "next_scientific_action": next_action,
+            "command": command,
+            "frontier_action": "STOP_CONTINUATION",
+            "forbidden_while_waiting": ["wait_agent", "list_agents", "status commentary"],
+        }
+        handoff_bytes = len(compact_json(monitor_record).encode("utf-8"))
+        state_already_present = state_path_value.exists()
+        if state_already_present:
+            existing_state = read_json(state_path_value, label="monitor state")
+            if existing_state.get("spec_sha256") != _monitor_fingerprint(spec):
+                raise ResearchManagerError(
+                    f"monitor state for {run_id} belongs to a different specification"
+                )
+        else:
+            atomic_write_json(
+                state_path_value,
+                _monitor_bootstrap_state(spec, handoff_bytes=handoff_bytes),
+            )
+        result = {
+            "schema": SCHEMA_VERSION,
+            "run_id": run_id,
+            "monitor": monitor_record,
+            "state": "WAITING_FOR_EXTERNAL_EVENT",
+            "instruction": (
+                "Start this deterministic command in the single cluster_monitor, fork no conversation history, "
+                "then end the frontier turn. Do not call wait_agent or list_agents."
+            ),
+        }
+        if spec_already_present and state_already_present and record.get("monitor") == monitor_record:
+            result["idempotent"] = True
+            return result
+        record["monitor"] = monitor_record
+        save_record(root, record)
+        research_state["status"] = f"waiting for {normalized_phase.lower()} via deterministic monitor: {run_id}"
+        research_state["next_decision"] = (
+            f"resume only from {monitor_record['wake_file']}; next scientific action: {next_action}"
+        )
+        save_state(root, research_state)
+        event(
+            root,
+            run_id,
+            "monitor_armed",
+            phase=normalized_phase,
+            spec_path=monitor_record["spec_path"],
+            state_path=monitor_record["state_path"],
+            wake_conditions=wake_conditions,
+        )
+        result["idempotent"] = False
+        return result
 
 
 def set_run_state(root: Path, run_id: str, target: str, reason: str) -> dict[str, Any]:
@@ -1431,6 +1808,22 @@ def compact_run(root: Path, record: dict[str, Any], *, include_summary: bool) ->
     ):
         if field in record:
             result[field] = record[field]
+    if isinstance(record.get("monitor"), dict):
+        monitor = record["monitor"]
+        result["monitor"] = {
+            key: monitor[key]
+            for key in (
+                "status",
+                "phase",
+                "spec_path",
+                "state_path",
+                "wake_file",
+                "wake_conditions",
+                "next_scientific_action",
+                "frontier_action",
+            )
+            if key in monitor
+        }
     if include_summary:
         summary = load_summary(root, record["run_id"])
         if summary:
@@ -1528,6 +1921,22 @@ def handoff_run(value: dict[str, Any]) -> dict[str, Any]:
             result[field] = items
         if omitted:
             result[f"omitted_{field}"] = omitted
+    monitor = value.get("monitor")
+    if isinstance(monitor, dict):
+        result["monitor"] = {
+            key: monitor[key]
+            for key in (
+                "status",
+                "phase",
+                "spec_path",
+                "state_path",
+                "wake_file",
+                "wake_conditions",
+                "next_scientific_action",
+                "frontier_action",
+            )
+            if key in monitor
+        }
     summary = value.get("summary")
     if isinstance(summary, dict):
         preferred_metric = str(value.get("primary_metric", {}).get("name", ""))
@@ -1787,6 +2196,11 @@ def build_evidence_manifest(
         sources.extend(("summary", item) for item in summary.get("evidence_paths", []))
     if health_path(root, run_id).exists():
         sources.append(("training_health", display_evidence_path(health_path(root, run_id), root)))
+    monitor = record.get("monitor", {})
+    if isinstance(monitor, dict):
+        for field in ("spec_path", "state_path", "event_log_path", "wake_file"):
+            if monitor.get(field):
+                sources.append((f"monitor_{field}", str(monitor[field])))
 
     grouped: dict[str, set[str]] = {}
     for source, value in sources:
@@ -1821,8 +2235,10 @@ def build_evidence_manifest(
 
 def inspect_run(root: Path, run_id: str, section: str = "all") -> dict[str, Any]:
     run_id = validate_run_id(run_id)
-    if section not in {"all", "spec", "record", "summary", "health", "evidence"}:
-        raise ResearchManagerError("inspect section must be all, spec, record, summary, health, or evidence")
+    if section not in {"all", "spec", "record", "summary", "health", "evidence", "monitor"}:
+        raise ResearchManagerError(
+            "inspect section must be all, spec, record, summary, health, evidence, or monitor"
+        )
     record = load_record(root, run_id)
     spec = load_spec(root, run_id)
     summary = load_summary(root, run_id)
@@ -1832,12 +2248,29 @@ def inspect_run(root: Path, run_id: str, section: str = "all") -> dict[str, Any]
         else None
     )
     evidence = build_evidence_manifest(root, run_id, spec, record, summary)
+    monitor: dict[str, Any] | None = None
+    if monitor_spec_path(root, run_id).exists():
+        monitor = {
+            "spec": read_json(monitor_spec_path(root, run_id), label="monitor specification"),
+            "state": (
+                read_json(monitor_state_path(root, run_id), label="monitor state")
+                if monitor_state_path(root, run_id).exists()
+                else None
+            ),
+            "wake": (
+                read_json(monitor_wake_path(root, run_id), label="monitor wake packet")
+                if monitor_wake_path(root, run_id).exists()
+                else None
+            ),
+            "event_log_path": display_evidence_path(monitor_events_path(root, run_id), root),
+        }
     sections = {
         "spec": spec,
         "record": record,
         "summary": summary,
         "health": health,
         "evidence": evidence,
+        "monitor": monitor,
     }
     report: dict[str, Any] = {
         "schema": SCHEMA_VERSION,
@@ -1989,6 +2422,7 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s plan experiment.json
   %(prog)s validate exp-001 --check "tests passed" --evidence reports/tests.txt
   %(prog)s record-launch exp-001 --job-id 64001 --log logs/exp-001.log
+  %(prog)s arm-monitor exp-001 --phase TRAINING --target-step 200000 --next-scientific-action "reduce and audit"
   %(prog)s sync exp-001 --json
   %(prog)s health exp-001 --json
   %(prog)s record-summary exp-001 summary.json
@@ -2022,6 +2456,38 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--log", action="append", default=[])
     launch.add_argument("--artifact", action="append", default=[])
     launch.add_argument("--json", action="store_true")
+
+    monitor = subparsers.add_parser(
+        "arm-monitor",
+        help="persist exact wake conditions and emit one deterministic blocking watch command",
+    )
+    monitor.add_argument("run_id")
+    monitor.add_argument(
+        "--phase",
+        default="TRAINING",
+        choices=("TRAINING", "EVALUATION", "REDUCTION", "OTHER"),
+    )
+    monitor.add_argument("--target-step", type=int)
+    monitor.add_argument("--checkpoint", action="append", default=[])
+    monitor.add_argument("--evaluation-complete", action="append", default=[])
+    monitor.add_argument("--training-complete", action="append", default=[])
+    monitor.add_argument("--known-warning-regex", action="append", default=[])
+    monitor.add_argument("--scientific-event-regex", action="append", default=[])
+    monitor.add_argument("--stall-seconds", type=float, default=1_800.0)
+    monitor.add_argument("--log-stall-seconds", type=float, default=1_800.0)
+    monitor.add_argument(
+        "--threshold",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="override a persisted invariant/routing threshold (repeatable)",
+    )
+    monitor.add_argument("--next-scientific-action", required=True)
+    monitor.add_argument(
+        "--cluster-manager",
+        default=os.environ.get("CLUSTER_MANAGER", "cluster-manager"),
+    )
+    monitor.add_argument("--json", action="store_true")
 
     run_transition = subparsers.add_parser("transition", help="record a controlled run-state transition")
     run_transition.add_argument("run_id")
@@ -2084,7 +2550,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("run_id")
     inspect.add_argument(
         "--section",
-        choices=("all", "spec", "record", "summary", "health", "evidence"),
+        choices=("all", "spec", "record", "summary", "health", "evidence", "monitor"),
         default="all",
     )
     inspect.add_argument("--json", action="store_true")
@@ -2103,6 +2569,23 @@ def execute(args: argparse.Namespace, root: Path) -> tuple[dict[str, Any], str]:
         return validate_run(root, args.run_id, args.check, args.evidence), "generic"
     if args.command == "record-launch":
         return record_launch(root, args.run_id, args.job_id, args.log, args.artifact), "generic"
+    if args.command == "arm-monitor":
+        return arm_monitor(
+            root,
+            args.run_id,
+            phase=args.phase,
+            target_step=args.target_step,
+            checkpoint_paths=args.checkpoint,
+            evaluation_complete_paths=args.evaluation_complete,
+            training_complete_paths=args.training_complete,
+            known_warning_regex=args.known_warning_regex,
+            scientific_event_regex=args.scientific_event_regex,
+            stall_seconds=args.stall_seconds,
+            log_stall_seconds=args.log_stall_seconds,
+            next_scientific_action=args.next_scientific_action,
+            cluster_manager=args.cluster_manager,
+            threshold_overrides=parse_monitor_threshold_args(args.threshold),
+        ), "generic"
     if args.command == "transition":
         return set_run_state(root, args.run_id, args.state, args.reason), "generic"
     if args.command == "sync":
