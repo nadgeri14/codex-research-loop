@@ -55,6 +55,16 @@ EFFORT = "xhigh"
 
 DEFAULT_SCRATCH_ROOT = "/lustre/nvwulf/scratch/anadgeri/codex-cache"
 
+
+def canonical_scratch_root() -> str:
+    """Machine-local canonical scratch anchor.
+
+    Overridable via MUSE_WORKER_SCRATCH_ROOT so the package is genuinely
+    portable to other machines/accounts; every scratch path (and the shared
+    repo lock) is anchored beneath this root.
+    """
+    return os.environ.get("MUSE_WORKER_SCRATCH_ROOT", DEFAULT_SCRATCH_ROOT)
+
 DEF_WALL_SECONDS = 1800
 HARD_WALL = 7200
 DEF_MAX_MODEL_STEPS = 40
@@ -92,6 +102,11 @@ EXIT_PATCH_OVERSIZED = 36
 EXIT_APPLY_INVALID = 40
 EXIT_APPLY_SCOPE = 41
 EXIT_APPLY_FAILED = 42
+
+# Transient outcomes: recorded, but they neither trigger unchanged-failure
+# suppression nor count toward attempt ceilings — an interrupt or a one-off
+# deadline overrun must not permanently block the identical retry.
+TRANSIENT_EXITS = frozenset({EXIT_INTERRUPTED, EXIT_MUSE_TIMEOUT, EXIT_VALIDATION_TIMEOUT})
 
 CLASS_FOR = {
     EXIT_SUCCESS: "success",
@@ -155,7 +170,9 @@ def validate_scratch(scratch_root: str) -> str:
     canon = os.path.realpath(os.path.abspath(scratch_root))
     if canon in ("/tmp", "/dev/shm") or canon.startswith("/tmp/") or canon.startswith("/dev/shm/"):
         raise ValueError(f"scratch {canon} forbidden /tmp or /dev/shm")
-    allowed = os.path.realpath(DEFAULT_SCRATCH_ROOT)
+    allowed = os.path.realpath(canonical_scratch_root())
+    if allowed in ("/", "/tmp", "/dev/shm") or allowed.startswith("/tmp/") or allowed.startswith("/dev/shm/"):
+        raise ValueError(f"canonical scratch root {allowed} forbidden")
     if not (canon == allowed or canon.startswith(allowed.rstrip("/") + "/")):
         raise ValueError(f"scratch {canon} not beneath {allowed}")
     if is_tmpfs(canon):
@@ -184,18 +201,24 @@ def run_git(cwd: str, args: List[str], timeout: int = GIT_TIMEOUT) -> subprocess
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, timeout=timeout)
 
 
+SNAPSHOT_GIT_TIMEOUT = 300
+
+
 def repo_snapshot(root: str) -> Dict[str, str]:
     """Compact identity of the main repository used to detect contamination."""
-    r = run_git(root, ["rev-parse", "HEAD"])
-    if r.returncode != 0:
-        raise ValueError(f"rev-parse HEAD failed: {r.stderr.decode(errors='ignore')[:200]}")
-    head = r.stdout.decode().strip()
-    r = run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    if r.returncode != 0:
-        raise ValueError(f"status failed: {r.stderr.decode(errors='ignore')[:200]}")
-    status_hash = sha256_bytes(r.stdout)
-    d1 = run_git(root, ["diff", "--binary"]).stdout
-    d2 = run_git(root, ["diff", "--cached", "--binary"]).stdout
+    try:
+        r = run_git(root, ["rev-parse", "HEAD"])
+        if r.returncode != 0:
+            raise ValueError(f"rev-parse HEAD failed: {r.stderr.decode(errors='ignore')[:200]}")
+        head = r.stdout.decode().strip()
+        r = run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], timeout=SNAPSHOT_GIT_TIMEOUT)
+        if r.returncode != 0:
+            raise ValueError(f"status failed: {r.stderr.decode(errors='ignore')[:200]}")
+        status_hash = sha256_bytes(r.stdout)
+        d1 = run_git(root, ["diff", "--binary"], timeout=SNAPSHOT_GIT_TIMEOUT).stdout
+        d2 = run_git(root, ["diff", "--cached", "--binary"], timeout=SNAPSHOT_GIT_TIMEOUT).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"repo snapshot timed out: {exc}")
     return {"head": head, "status_hash": status_hash, "diff_hash": sha256_bytes(d1 + d2)}
 
 
@@ -209,9 +232,17 @@ def validate_check_argv(argv: List[str], owned: List[str]) -> Optional[str]:
     for a in argv:
         if "\0" in a:
             return "NUL in argv"
+        s = a.strip()
+        if s.startswith("bash -c") or s.startswith("sh -c"):
+            return "shell string rejected"
     low = " ".join(argv).lower()
     if ".git" in low and any(cmd in low for cmd in ("rm ", "rm\t", "mv ", "unlink", "rmtree")):
         return ".git mutation rejected"
+    for arg in argv[1:]:
+        if arg.startswith("-"):
+            continue
+        if "/" in arg and ".." in arg.split("/"):
+            return f"path traversal in argv {arg!r}"
     if base0 in ("rm", "mv", "unlink", "cp", "chmod", "chown"):
         for arg in argv[1:]:
             if arg.startswith("-"):
@@ -232,7 +263,26 @@ def load_state(scratch: str, repo_canonical: str, contract_id: str) -> Dict[str,
         return {"attempts": []}
     if os.path.islink(str(p)):
         raise ValueError("state is symlink")
-    data = json.loads(p.read_text(encoding="utf-8"))
+    st = os.lstat(str(p))
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("state not regular")
+    if st.st_mode & 0o077:
+        raise ValueError(f"state unsafe perms {oct(st.st_mode & 0o777)}")
+    if st.st_size > 1024 * 1024:
+        raise ValueError("state oversized")
+    fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        data_bytes = b""
+        while True:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            data_bytes += chunk
+            if len(data_bytes) > 1024 * 1024:
+                raise ValueError("state oversized")
+    finally:
+        os.close(fd)
+    data = json.loads(data_bytes.decode("utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("attempts"), list):
         raise ValueError("malformed state")
     return data
@@ -243,35 +293,24 @@ def save_state_atomic(scratch: str, repo_canonical: str, contract_id: str, state
     base.mkdir(parents=True, exist_ok=True)
     os.chmod(base, 0o700)
     tmp = base / f".state.{uuid.uuid4().hex}.tmp"
-    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         os.write(fd, json.dumps(state, indent=2, sort_keys=True).encode("utf-8"))
         os.fsync(fd)
     finally:
         os.close(fd)
     tmp.replace(base / "state.json")
-
-
-def kill_pgroup(pgid: int, proc: subprocess.Popen, grace: int = DEF_GRACE_SECONDS) -> bool:
-    """TERM then KILL the process group; return True if an orphan survives."""
     try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
+        dfd = os.open(str(base), os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except Exception:
         pass
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline and proc.poll() is None:
-        time.sleep(0.05)
-    if proc.poll() is None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
+
+
+def _pgroup_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
         return True
@@ -279,6 +318,38 @@ def kill_pgroup(pgid: int, proc: subprocess.Popen, grace: int = DEF_GRACE_SECOND
         return False
     except Exception:
         return True
+
+
+def kill_pgroup(pgid: int, proc: subprocess.Popen, grace: int = DEF_GRACE_SECONDS) -> bool:
+    """TERM then KILL the whole process group; return True if an orphan survives.
+
+    Escalation is gated on the GROUP still existing, not on the direct child:
+    a TERM-ignoring grandchild must be SIGKILLed even after the leader exits.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        pass
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _pgroup_alive(pgid):
+            break
+        time.sleep(0.05)
+    if _pgroup_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+    time.sleep(0.1)
+    return _pgroup_alive(pgid)
 
 
 def run_captured(argv: List[str], cwd: str, env: Dict[str, str], wall_deadline: float,
@@ -376,6 +447,8 @@ def parse_args(argv=None):
                    help="Authorize a run that produces no changes (default fail-closed)")
     p.add_argument("--muse-bin", default="muse", help="muse binary (tests may point at a fake)")
     p.add_argument("--apply-patch", help="Apply mode: patch file from a reviewed prior run")
+    p.add_argument("--allow-base-mismatch", action="store_true",
+                   help="Apply mode: proceed although HEAD differs from the reviewed patch's base (or the patch has no meta sidecar); default fail-closed")
     args = p.parse_args(argv)
     if not args.owned_paths:
         p.error("at least one --owned-path required")
@@ -451,7 +524,9 @@ def numstat_paths(root: str, patch_path: str) -> Optional[List[str]]:
         txt = ent.decode("utf-8", errors="surrogateescape")
         parts = txt.split("\t")
         if len(parts) >= 3:
-            paths.append(parts[2])
+            # the path itself may contain literal tabs (unquoted in -z mode):
+            # rejoin everything after the two count fields
+            paths.append("\t".join(parts[2:]))
         elif len(parts) == 1 and txt:
             # -z rename continuation record (patches are generated with
             # --no-renames, but stay fail-closed if one appears anyway)
@@ -542,9 +617,11 @@ def main(argv=None) -> int:
                 eprint(f"preflight check rejected: {err}")
                 return finish(EXIT_PREFLIGHT, {"error": err})
         # Shared repo lock file namespace with the direct worker: the two lanes
-        # exclude each other on one repository.
+        # exclude each other on one repository. Anchored at the CANONICAL
+        # scratch root (not the caller-narrowed --scratch-root) so the mutual
+        # exclusion holds regardless of which scratch subtree each run uses.
         try:
-            lock_dir = Path(scratch) / "muse-worker-locks"
+            lock_dir = Path(os.path.realpath(canonical_scratch_root())) / "muse-worker-locks"
             lock_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(lock_dir, 0o700)
             repo_hash = hashlib.sha256(root.encode()).hexdigest()[:16]
@@ -574,15 +651,6 @@ def main(argv=None) -> int:
                 return finish(EXIT_APPLY_INVALID)
             wbytes("apply_patch.copy", patch_bytes)
             wtext("apply_patch.sha256", sha256_bytes(patch_bytes) + "\n")
-            meta_path = Path(patch_path).with_suffix(".meta.json")
-            if meta_path.is_file():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    cur_head = run_git(root, ["rev-parse", "HEAD"]).stdout.decode().strip()
-                    if meta.get("base_head") and meta["base_head"] != cur_head:
-                        eprint(f"apply: WARNING base HEAD {meta['base_head'][:12]} != current {cur_head[:12]}")
-                except Exception:
-                    pass
             paths = numstat_paths(root, patch_path)
             if paths is None:
                 eprint("apply: git apply --numstat failed (invalid patch)")
@@ -591,6 +659,24 @@ def main(argv=None) -> int:
             if outside:
                 eprint(f"apply: patch touches outside-owned paths {outside}")
                 return finish(EXIT_APPLY_SCOPE, {"outside": outside})
+            # Base-HEAD verification is fail-closed: a patch was reviewed
+            # against one specific commit and must not silently land on
+            # drifted code (or without provenance) unless explicitly allowed.
+            meta_path = Path(patch_path).with_suffix(".meta.json")
+            cur_head = run_git(root, ["rev-parse", "HEAD"]).stdout.decode().strip()
+            base_head = None
+            if meta_path.is_file():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    base_head = meta.get("base_head")
+                except Exception:
+                    base_head = None
+            if base_head != cur_head and not args.allow_base_mismatch:
+                if base_head is None:
+                    eprint("apply: no patch.meta.json base_head (pass --allow-base-mismatch to override)")
+                else:
+                    eprint(f"apply: base HEAD {base_head[:12]} != current {cur_head[:12]} (pass --allow-base-mismatch to override)")
+                return finish(EXIT_APPLY_INVALID, {"base_head": base_head, "current_head": cur_head, "error": "base mismatch"})
             r = run_git(root, ["apply", "--check", "--binary", patch_path])
             if r.returncode != 0:
                 eprint(f"apply: git apply --check failed: {r.stderr.decode(errors='ignore')[:500]}")
@@ -599,8 +685,38 @@ def main(argv=None) -> int:
             if r.returncode != 0:
                 eprint(f"apply: git apply failed: {r.stderr.decode(errors='ignore')[:500]}")
                 return finish(EXIT_APPLY_FAILED, {"error": r.stderr.decode(errors="ignore")[:1000]})
-            print(f"cli-lane apply: success paths={sorted(set(paths))}")
-            return finish(EXIT_SUCCESS, {"mode": "apply", "applied_paths": sorted(set(paths))})
+
+            def rollback() -> bool:
+                rr = run_git(root, ["apply", "-R", "--binary", patch_path])
+                return rr.returncode == 0
+
+            # Caller-declared checks gate the apply: run them in the MAIN
+            # repository; any failure rolls the patch back.
+            val_results = []
+            for idx, check in enumerate(args.parsed_checks):
+                vres = run_captured(check, root, os.environ.copy(), wall_deadline,
+                                    ev_base / f"apply_validation_{idx}_stdout.log",
+                                    ev_base / f"apply_validation_{idx}_stderr.log",
+                                    MAX_VALIDATION_STDOUT, MAX_VALIDATION_STDERR, interrupted)
+                val_results.append({"argv": check, **vres})
+                if vres["interrupted"] or vres["timed_out"] or vres["exit_code"] != 0:
+                    wjson("apply_validation_results.json", val_results)
+                    rolled = rollback()
+                    if vres["interrupted"]:
+                        code = EXIT_INTERRUPTED
+                    elif vres["timed_out"]:
+                        code = EXIT_VALIDATION_TIMEOUT
+                    else:
+                        code = EXIT_VALIDATION_FAILED
+                    if not rolled:
+                        eprint("apply: post-apply check failed AND rollback failed — repository needs manual attention")
+                        return finish(EXIT_PERSISTENCE, {"error": "check failed and rollback failed", "failed_idx": idx})
+                    eprint(f"apply: post-apply check {idx} failed; patch rolled back")
+                    return finish(code, {"failed_idx": idx, "rolled_back": True})
+            if val_results:
+                wjson("apply_validation_results.json", val_results)
+            print(f"cli-lane apply: success paths={sorted(set(paths))} checks={len(val_results)}")
+            return finish(EXIT_SUCCESS, {"mode": "apply", "applied_paths": sorted(set(paths)), "validations": len(val_results)})
 
         # ------------------------------------------------------------------
         # Run mode.
@@ -626,8 +742,10 @@ def main(argv=None) -> int:
             eprint(f"state malformed: {exc}")
             return finish(EXIT_PERSISTENCE, {"error": str(exc)[:1000]})
         attempts = state.get("attempts", [])
-        initial_cnt = sum(1 for a in attempts if a.get("attempt_kind") == "initial")
-        corr_cnt = sum(1 for a in attempts if a.get("attempt_kind") == "correction")
+        # transient outcomes (interrupt, deadline overrun) do not consume ceilings
+        counted = [a for a in attempts if a.get("exit_code") not in TRANSIENT_EXITS]
+        initial_cnt = sum(1 for a in counted if a.get("attempt_kind") == "initial")
+        corr_cnt = sum(1 for a in counted if a.get("attempt_kind") == "correction")
         if args.attempt_kind == "initial" and initial_cnt >= DEF_MAX_INITIAL:
             eprint(f"initial ceiling {initial_cnt} >= {DEF_MAX_INITIAL}")
             return finish(EXIT_CEILING)
@@ -640,7 +758,8 @@ def main(argv=None) -> int:
             "wall": args.wall_seconds, "steps": args.max_model_steps,
         }, sort_keys=True).encode())
         for a in reversed(attempts):
-            if a.get("fingerprint") == fp and a.get("exit_code") != EXIT_SUCCESS:
+            if (a.get("fingerprint") == fp and a.get("exit_code") != EXIT_SUCCESS
+                    and a.get("exit_code") not in TRANSIENT_EXITS):
                 eprint(f"suppressed unchanged fingerprint {fp[:8]}")
                 return finish(EXIT_SUPPRESSED, {"fingerprint": fp})
 
@@ -708,6 +827,30 @@ def main(argv=None) -> int:
                            ev_base / "muse_stdout.jsonl", ev_base / "muse_stderr.log",
                            MAX_MUSE_STDOUT, MAX_MUSE_STDERR, interrupted)
         wjson("muse_result.json", res)
+        # Main-repo integrity is verified on EVERY post-run path — the runs
+        # most likely to have misbehaved (timeout, crash, interrupt) must not
+        # skip the contamination check.
+        try:
+            after = repo_snapshot(root)
+        except Exception as exc:
+            eprint(f"cannot verify main repo integrity after run: {exc}")
+            record_attempt(EXIT_PERSISTENCE)
+            code = finish(EXIT_PERSISTENCE, {"error": str(exc)[:1000], "muse_result": res, "worktree": str(wt_path)})
+            wt_path = None
+            return code
+        wjson("after_repo.json", after)
+        if after != before:
+            eprint("main repository changed during the run — contamination, fail closed")
+            record_attempt(EXIT_CONTAMINATION)
+            code = finish(EXIT_CONTAMINATION, {"before": before, "after": after, "muse_result": res, "worktree": str(wt_path)})
+            wt_path = None
+            return code
+        if res["orphan"]:
+            eprint("process-group orphan survived kill escalation — fail closed")
+            record_attempt(EXIT_PERSISTENCE)
+            code = finish(EXIT_PERSISTENCE, {"error": "orphan process survived", "muse_result": res, "worktree": str(wt_path)})
+            wt_path = None
+            return code
         if res["interrupted"]:
             record_attempt(EXIT_INTERRUPTED)
             return finish(EXIT_INTERRUPTED)
@@ -724,28 +867,18 @@ def main(argv=None) -> int:
             wt_path = None
             return code
 
-        try:
-            after = repo_snapshot(root)
-        except Exception as exc:
-            eprint(f"after snapshot failed: {exc}")
-            record_attempt(EXIT_CONTAMINATION)
-            return finish(EXIT_CONTAMINATION, {"error": str(exc)[:1000]})
-        wjson("after_repo.json", after)
-        if after != before:
-            eprint("main repository changed during the run — contamination, fail closed")
-            record_attempt(EXIT_CONTAMINATION)
-            code = finish(EXIT_CONTAMINATION, {"before": before, "after": after, "worktree": str(wt_path)})
-            wt_path = None
-            return code
-
         r = run_git(str(wt_path), ["add", "-A"])
         if r.returncode != 0:
             eprint(f"worktree add -A failed: {r.stderr.decode(errors='ignore')[:300]}")
             record_attempt(EXIT_PREFLIGHT)
             return finish(EXIT_PREFLIGHT, {"error": "worktree stage failed"})
-        r = run_git(str(wt_path), ["diff", "--cached", "--name-only", "-z"])
+        # Diff against the BASE commit, not the worktree's current HEAD: a
+        # yolo agent may commit its work despite the prompt's instruction, and
+        # committed work must be captured, not discarded as an empty diff.
+        base_head = before["head"]
+        r = run_git(str(wt_path), ["diff", "--cached", "--name-only", "-z", base_head])
         changed = sorted(p for p in r.stdout.decode(errors="surrogateescape").split("\0") if p)
-        patch = run_git(str(wt_path), ["diff", "--cached", "--binary", "--no-renames"], timeout=120).stdout
+        patch = run_git(str(wt_path), ["diff", "--cached", "--binary", "--no-renames", base_head], timeout=120).stdout
         if len(patch) > MAX_PATCH_BYTES:
             eprint(f"patch oversized {len(patch)} > {MAX_PATCH_BYTES}")
             record_attempt(EXIT_PATCH_OVERSIZED)
@@ -780,6 +913,14 @@ def main(argv=None) -> int:
                                 ev_base / f"validation_{idx}_stderr.log",
                                 MAX_VALIDATION_STDOUT, MAX_VALIDATION_STDERR, interrupted)
             val_results.append({"argv": check, **vres})
+            if vres["orphan"]:
+                wjson("validation_results.json", val_results)
+                record_attempt(EXIT_PERSISTENCE)
+                return finish(EXIT_PERSISTENCE, {"error": "validation orphan survived", "failed_idx": idx})
+            if vres["interrupted"]:
+                wjson("validation_results.json", val_results)
+                record_attempt(EXIT_INTERRUPTED)
+                return finish(EXIT_INTERRUPTED, {"failed_idx": idx})
             if vres["timed_out"]:
                 wjson("validation_results.json", val_results)
                 record_attempt(EXIT_VALIDATION_TIMEOUT)

@@ -40,9 +40,7 @@ if dump:
         json.dump({"argv": sys.argv[1:], "cwd": os.getcwd(),
                    "prompt": open(arg_after("--prompt-file")).read() if arg_after("--prompt-file") else None}, fh)
 
-mode = os.environ.get("FAKE_MUSE_MODE", "noop")
-print(json.dumps({"event": "session.start", "mode": mode}))
-if mode == "edit":
+def do_edits():
     for spec in json.loads(os.environ.get("FAKE_MUSE_EDITS", "[]")):
         p = spec["path"]
         d = os.path.dirname(p)
@@ -50,12 +48,26 @@ if mode == "edit":
             os.makedirs(d, exist_ok=True)
         with open(p, "w") as fh:
             fh.write(spec["content"])
+
+mode = os.environ.get("FAKE_MUSE_MODE", "noop")
+print(json.dumps({"event": "session.start", "mode": mode}))
+if mode == "edit":
+    do_edits()
+elif mode == "commit":
+    import subprocess
+    do_edits()
+    subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "agent commit"], check=True, capture_output=True)
 elif mode == "outside":
     with open("outside_cli.txt", "w") as fh:
         fh.write("evil")
 elif mode == "contaminate":
     with open(os.path.join(os.environ["FAKE_MUSE_MAIN_ROOT"], "contaminated.txt"), "w") as fh:
         fh.write("evil")
+elif mode == "contaminate_fail":
+    with open(os.path.join(os.environ["FAKE_MUSE_MAIN_ROOT"], "contaminated.txt"), "w") as fh:
+        fh.write("evil")
+    sys.exit(3)
 elif mode == "sleep":
     time.sleep(float(os.environ.get("FAKE_MUSE_SLEEP", "10")))
 elif mode == "fail":
@@ -263,9 +275,62 @@ class TestMuseCliWorker(unittest.TestCase):
         res = self.run_lane(ws, f"apinv-{uuid.uuid4().hex[:4]}", apply_patch=bad)
         self.assertEqual(res.returncode, 40, res.stdout + res.stderr)
 
-    def test_lock_contention(self):
+    def test_apply_tab_filename_cannot_bypass_scope(self):
+        # a filename containing a literal tab must not truncate at the tab and
+        # sneak past the owned-path gate
         ws = make_workspace(self.scratch_root)
-        lock_dir = self.scratch_root / "muse-worker-locks"
+        ws2 = make_workspace(self.scratch_root)
+        (ws2 / "owned.txt\tx").write_text("evil")
+        subprocess.run(["git", "add", "-A"], cwd=str(ws2), check=True, stdout=subprocess.DEVNULL)
+        patch_bytes = subprocess.run(["git", "diff", "--cached", "--binary", "--no-renames"],
+                                     cwd=str(ws2), capture_output=True, check=True).stdout
+        patch = self.scratch_root / "tabname.diff"
+        patch.write_bytes(patch_bytes)
+        res = self.run_lane(ws, f"aptab-{uuid.uuid4().hex[:4]}", apply_patch=patch, owned=["owned.txt"])
+        self.assertEqual(res.returncode, 41, res.stdout + res.stderr)
+        self.assertFalse((ws / "owned.txt\tx").exists())
+
+    def test_apply_base_mismatch_fails_closed(self):
+        ws = make_workspace(self.scratch_root)
+        edits = [{"path": "owned.txt", "content": "hi world"}]
+        res = self.run_lane(ws, f"apbase-{uuid.uuid4().hex[:4]}", mode="edit",
+                            env_extra={"FAKE_MUSE_EDITS": json.dumps(edits)})
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        patch = self.evidence_dir(res) / "patch.diff"
+        # move HEAD with an unrelated commit
+        (ws / "unrelated.txt").write_text("x")
+        subprocess.run(["git", "add", "-A"], cwd=str(ws), check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "commit", "-qm", "move head"], cwd=str(ws), check=True, stdout=subprocess.DEVNULL)
+        res2 = self.run_lane(ws, f"apbase2-{uuid.uuid4().hex[:4]}", apply_patch=patch)
+        self.assertEqual(res2.returncode, 40, res2.stdout + res2.stderr)
+        self.assertEqual((ws / "owned.txt").read_text(), "hello world")
+        res3 = self.run_lane(ws, f"apbase3-{uuid.uuid4().hex[:4]}", apply_patch=patch,
+                             extra=["--allow-base-mismatch"])
+        self.assertEqual(res3.returncode, 0, res3.stdout + res3.stderr)
+        self.assertEqual((ws / "owned.txt").read_text(), "hi world")
+
+    def test_apply_runs_checks_and_rolls_back_on_failure(self):
+        ws = make_workspace(self.scratch_root)
+        edits = [{"path": "owned.txt", "content": "hi world"}]
+        res = self.run_lane(ws, f"apchk-{uuid.uuid4().hex[:4]}", mode="edit",
+                            env_extra={"FAKE_MUSE_EDITS": json.dumps(edits)})
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        patch = self.evidence_dir(res) / "patch.diff"
+        res2 = self.run_lane(ws, f"apchk2-{uuid.uuid4().hex[:4]}", apply_patch=patch,
+                             checks=[["python3", "-c", "import sys; sys.exit(1)"]])
+        self.assertEqual(res2.returncode, 22, res2.stdout + res2.stderr)
+        self.assertEqual((ws / "owned.txt").read_text(), "hello world")
+        res3 = self.run_lane(ws, f"apchk3-{uuid.uuid4().hex[:4]}", apply_patch=patch,
+                             checks=[["python3", "-c", "import sys; sys.exit(0)"]])
+        self.assertEqual(res3.returncode, 0, res3.stdout + res3.stderr)
+        self.assertEqual((ws / "owned.txt").read_text(), "hi world")
+
+    def test_lock_contention(self):
+        # the lock is anchored at the CANONICAL scratch root, independent of
+        # the caller-narrowed --scratch-root, so both lanes exclude each other
+        ws = make_workspace(self.scratch_root)
+        canonical = Path(os.path.realpath("/lustre/nvwulf/scratch/anadgeri/codex-cache"))
+        lock_dir = canonical / "muse-worker-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         repo_hash = hashlib.sha256(os.path.realpath(os.path.abspath(str(ws))).encode()).hexdigest()[:16]
         fd = os.open(str(lock_dir / f"repo-{repo_hash}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
@@ -275,6 +340,65 @@ class TestMuseCliWorker(unittest.TestCase):
             self.assertEqual(res.returncode, 12, res.stdout + res.stderr)
         finally:
             os.close(fd)
+
+    def test_scratch_env_override(self):
+        alt_root = Path(f"/lustre/nvwulf/scratch/anadgeri/muse-cli-alt-root-{uuid.uuid4().hex[:8]}")
+        alt_scratch = alt_root / "sub"
+        try:
+            ws = make_workspace(self.scratch_root)
+            # without the env override, a scratch outside the default canonical
+            # root is rejected at preflight
+            cmd = [sys.executable, WRAPPER, "--root", str(ws), "--contract-id", "altroot",
+                   "--contract", str(self.contract), "--owned-path", "owned.txt",
+                   "--scratch-root", str(alt_scratch), "--muse-bin", str(self.fake_muse), "--allow-empty"]
+            env = os.environ.copy()
+            env["FAKE_MUSE_MODE"] = "noop"
+            env.pop("MUSE_WORKER_SCRATCH_ROOT", None)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env, cwd=str(REPO_ROOT))
+            self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+            # with MUSE_WORKER_SCRATCH_ROOT the same invocation succeeds
+            env["MUSE_WORKER_SCRATCH_ROOT"] = str(alt_root)
+            res2 = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env, cwd=str(REPO_ROOT))
+            self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+            # /tmp can never be the scratch, env override or not
+            env["MUSE_WORKER_SCRATCH_ROOT"] = "/tmp"
+            cmd_tmp = list(cmd)
+            cmd_tmp[cmd_tmp.index(str(alt_scratch))] = "/tmp/x"
+            res3 = subprocess.run(cmd_tmp, capture_output=True, text=True, timeout=60, env=env, cwd=str(REPO_ROOT))
+            self.assertEqual(res3.returncode, 10, res3.stdout + res3.stderr)
+        finally:
+            shutil.rmtree(str(alt_root), ignore_errors=True)
+
+    def test_committed_work_captured(self):
+        # a yolo agent that commits in the worktree must not lose its work
+        ws = make_workspace(self.scratch_root)
+        edits = [{"path": "owned.txt", "content": "hi world"}]
+        res = self.run_lane(ws, f"commit-{uuid.uuid4().hex[:4]}", mode="commit",
+                            env_extra={"FAKE_MUSE_EDITS": json.dumps(edits)})
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        ev = self.evidence_dir(res)
+        meta = json.loads((ev / "patch.meta.json").read_text())
+        self.assertEqual(meta["changed"], ["owned.txt"])
+        self.assertIn(b"hi world", (ev / "patch.diff").read_bytes())
+
+    def test_contamination_detected_even_when_muse_fails(self):
+        ws = make_workspace(self.scratch_root)
+        res = self.run_lane(ws, f"contfail-{uuid.uuid4().hex[:4]}", mode="contaminate_fail",
+                            env_extra={"FAKE_MUSE_MAIN_ROOT": str(ws)})
+        self.assertEqual(res.returncode, 35, res.stdout + res.stderr)
+
+    def test_timeout_does_not_suppress_retry(self):
+        ws = make_workspace(self.scratch_root)
+        cid = f"transient-{uuid.uuid4().hex[:4]}"
+        res = self.run_lane(ws, cid, mode="sleep", env_extra={"FAKE_MUSE_SLEEP": "30"},
+                            extra=["--wall-seconds", "3"])
+        self.assertEqual(res.returncode, 32, res.stdout + res.stderr)
+        # identical fingerprint (same contract/owned/wall/steps) must not be suppressed
+        edits = [{"path": "owned.txt", "content": "hi world"}]
+        res2 = self.run_lane(ws, cid, mode="edit",
+                             env_extra={"FAKE_MUSE_EDITS": json.dumps(edits)},
+                             extra=["--wall-seconds", "3"])
+        self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
 
     def test_missing_muse_binary(self):
         ws = make_workspace(self.scratch_root)

@@ -43,6 +43,13 @@ ENDPOINT_SCHEME = "https"
 
 DEFAULT_SCRATCH_ROOT = "/lustre/nvwulf/scratch/anadgeri/codex-cache"
 
+
+def canonical_scratch_root() -> str:
+    """Machine-local canonical scratch anchor (MUSE_WORKER_SCRATCH_ROOT overrides
+    the default for portability); scratch paths and the shared repo lock are
+    anchored beneath it."""
+    return os.environ.get("MUSE_WORKER_SCRATCH_ROOT", DEFAULT_SCRATCH_ROOT)
+
 # budgets
 DEF_WALL_SECONDS = 1800
 DEF_HTTP_SECONDS = 60
@@ -147,7 +154,9 @@ def validate_scratch(scratch_root: str) -> str:
     canon = os.path.realpath(os.path.abspath(scratch_root))
     if canon in ("/tmp", "/dev/shm") or canon.startswith("/tmp/") or canon.startswith("/dev/shm/"):
         raise ValueError(f"scratch {canon} forbidden /tmp or /dev/shm")
-    allowed = os.path.realpath(DEFAULT_SCRATCH_ROOT)
+    allowed = os.path.realpath(canonical_scratch_root())
+    if allowed in ("/", "/tmp", "/dev/shm") or allowed.startswith("/tmp/") or allowed.startswith("/dev/shm/"):
+        raise ValueError(f"canonical scratch root {allowed} forbidden")
     if not (canon == allowed or canon.startswith(allowed.rstrip("/") + "/")):
         raise ValueError(f"scratch {canon} not beneath {allowed}")
     # fail-closed mount inspection
@@ -1509,7 +1518,10 @@ def main(argv=None) -> int:
     repo_lock_fd = None
     state_lock_fd = None
     try:
-        lock_dir = Path(scratch) / "muse-worker-locks"
+        # Anchored at the CANONICAL scratch root (not the caller-narrowed
+        # --scratch-root) so the CLI lane and the direct worker exclude each
+        # other on one repository regardless of scratch narrowing.
+        lock_dir = Path(os.path.realpath(canonical_scratch_root())) / "muse-worker-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(lock_dir, 0o700)
         repo_hash = hashlib.sha256(root.encode()).hexdigest()[:16]
