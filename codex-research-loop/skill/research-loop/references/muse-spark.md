@@ -24,7 +24,7 @@ python scripts/muse_research_worker.py \
   --attempt-kind initial --contract-id ID
 ```
 
-Do not use raw `muse exec`. Muse Spark remains the sole implementation model; the local CLI orchestration layer is bypassed. No model tools, no shell tools, no subagents. Finite budgets, canonical scratch under the wrapper's machine-local scratch root default (`--scratch-root` may narrow it; never `/tmp`/`/dev/shm`/tmpfs/ramfs, no chmod of shared root), wrapper-owned `0700`/`0600` evidence and env dirs (`TMPDIR` etc. redirected). The model never chooses validation; it proposes only `replace`/`create`/`delete` edits within owned scope.
+Never use raw, unwrapped `muse exec`. Muse Spark remains the sole implementation model; the local CLI orchestration layer is bypassed on this default lane (no model tools, no shell tools, no subagents). The only permitted `muse exec` path is the gated CLI lane below, and only as an escalation. Finite budgets, canonical scratch under the wrapper's machine-local scratch root default (`--scratch-root` may narrow it; never `/tmp`/`/dev/shm`/tmpfs/ramfs, no chmod of shared root), wrapper-owned `0700`/`0600` evidence and env dirs (`TMPDIR` etc. redirected). The model never chooses validation; it proposes only `replace`/`create`/`delete` edits within owned scope.
 
 ## Request/response and edits
 
@@ -37,6 +37,23 @@ Edits are transactional: every file computed in memory, absolute/`..`/NUL/symlin
 Validations are caller-predeclared; the wrapper runs each in a new process group under scratch env, TERM→KILL with bounded grace, bounded raw capture, success only from true exit code (no pipelines). Scope verified via git baseline on `-z`/`diff`/`HEAD`/index movement; dirty outside-owned untracked/tracked changes, renames with spaces, deletions, Git errors fail closed. Repository/contract lock held from baseline through state persistence; concurrent wrapper refused. Attempts finite (initial/correction ceilings), unchanged-failure fingerprint suppressed, state locked/atomic/durable. Evidence includes contract hash, file identities, sanitized request hash, raw response hash, HTTP meta without auth, parsed proposal, applied paths, validation argv/results, baseline/scope, attempt kind, exit classification, bounded handoff — never credentials.
 
 No user-wide installation. Installer unchanged in Phase 1.
+
+## Gated CLI lane (escalation only)
+
+When a contract genuinely needs repository exploration or iterative test-fixing — typically after it has bounced off the direct worker (correction ceiling, repeated invalid proposals) — escalate to the gated CLI lane `scripts/muse_cli_worker.py`. It is the only permitted `muse exec` path:
+
+```bash
+python scripts/muse_cli_worker.py \
+  --root REPO --contract CONTRACT --contract-id ID --attempt-kind initial \
+  --owned-path REL \
+  --check-json '["python","-m","py_compile","scripts/x.py"]' \
+  --wall-seconds 1800 --max-model-steps 40
+```
+
+- The agent never runs in the main repository: the wrapper creates a detached git worktree under canonical scratch and runs `muse exec` there with `--yolo --user-input-auto-resolve --json --no-foreign-personal-context --disable-web-tools`, model `muse-spark-1.2-contributor` at `xhigh`, `stdin=/dev/null`, a hard wall deadline (process-group TERM→KILL), and bounded evidence capture. `--yolo` exists because approval prompts and the sandbox proxy caused headless stalls; isolation now comes from the disposable worktree plus the review gate, not the sandbox.
+- After the run the wrapper verifies the main repository is untouched (fail closed on contamination), extracts `patch.diff` + `patch.meta.json` into evidence, fail-closes on empty diffs (unless `--allow-empty`) and on changes outside `--owned-path`, then runs the caller-declared checks inside the worktree.
+- Nothing is applied automatically. Sol-high reviews the patch; a favorable review is followed by `python scripts/muse_cli_worker.py --root REPO --contract-id ID --owned-path REL --apply-patch EVIDENCE/patch.diff`, which re-verifies owned scope and applies to the main repository.
+- Attempt ceilings, unchanged-failure suppression, and the repo lock mirror the direct worker; both lanes share the repo lock, so they exclude each other on one repository. The worktree sees committed `HEAD` only — cut CLI-lane contracts against committed state.
 
 ## Review and correction loop
 
