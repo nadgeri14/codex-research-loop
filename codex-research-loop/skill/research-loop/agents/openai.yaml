@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Loop"
+  short_description: "Evidence-preserving scientific research loops"
+  default_prompt: "Use $research-loop to run this research project with durable experiment state and bounded evidence handoffs."
