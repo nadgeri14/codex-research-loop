@@ -167,8 +167,10 @@ def start_server(cfg: dict):
     time.sleep(0.05)
     return srv, t
 
-def run_wrapper(workspace, contract, owned_paths, scratch_root, contract_id, attempt_kind="initial", context_paths=None, checks=None, extra=None, env_extra=None, endpoint=None, cred_path=None):
+def run_wrapper(workspace, contract, owned_paths, scratch_root, contract_id, attempt_kind="initial", context_paths=None, checks=None, extra=None, env_extra=None, endpoint=None, cred_path=None, allow_empty=False):
     cmd = [sys.executable, WRAPPER, "--root", str(workspace), "--contract", str(contract), "--scratch-root", str(scratch_root), "--attempt-kind", attempt_kind, "--contract-id", contract_id]
+    if allow_empty:
+        cmd.append("--allow-empty")
     for o in owned_paths:
         cmd.extend(["--owned-path", o])
     if context_paths:
@@ -306,7 +308,7 @@ class TestMuseWorker(unittest.TestCase):
             proposal = make_proposal([])
             srv, ep = self.start({"resp_body": wrap_response(proposal)})
             cred = make_credential(self.scratch_root, shape, f"shape-{shape}-token-123456")
-            res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"cred-{shape}-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred)
+            res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"cred-{shape}-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred, allow_empty=True)
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
             ev = evidence_dir_from(res)
             txt = "".join(p.read_text(errors="ignore") for p in ev.rglob("*") if p.is_file())
@@ -646,7 +648,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["a.txt"], self.scratch_root, f"valto-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "import time; time.sleep(5)"]], endpoint=ep, cred_path=cred, extra=["--wall-seconds", "3"])
+        res = run_wrapper(ws, contract, ["a.txt"], self.scratch_root, f"valto-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "import time; time.sleep(5)"]], endpoint=ep, cred_path=cred, extra=["--wall-seconds", "3"], allow_empty=True)
         self.assertEqual(res.returncode, 23)
 
     def test_validation_term_resistant_cleanup(self):
@@ -657,7 +659,7 @@ class TestMuseWorker(unittest.TestCase):
         cred = make_credential(self.scratch_root)
         # child ignores TERM
         script = "import signal, time; signal.signal(signal.SIGTERM, lambda s,f: None); time.sleep(5)"
-        res = run_wrapper(ws, contract, ["a.txt"], self.scratch_root, f"term-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", script]], endpoint=ep, cred_path=cred, extra=["--wall-seconds", "3"])
+        res = run_wrapper(ws, contract, ["a.txt"], self.scratch_root, f"term-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", script]], endpoint=ep, cred_path=cred, extra=["--wall-seconds", "3"], allow_empty=True)
         self.assertEqual(res.returncode, 23)
         # ensure no leftover: check that after wrapper, no sleep process remains with our scratch?
         # we just verify exit code and that wrapper cleaned up
@@ -669,7 +671,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"dirtyok-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"dirtyok-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 0)
         self.assertEqual((ws / "outside.txt").read_text(), "dirty")
 
@@ -684,7 +686,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"tracked-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "echo mod > tracked.txt"]], endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"tracked-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "open('tracked.txt','w').write('mod')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
 
     def test_dirty_outside_untracked(self):
@@ -693,7 +695,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"untracked-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "echo hi > outside_new.txt"]], endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"untracked-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "open('outside_new.txt','w').write('hi')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
         self.assertTrue((ws / "outside_new.txt").exists())
 
@@ -707,7 +709,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"space-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "echo mod > 'file with space.txt'"]], endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"space-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "open('file with space.txt','w').write('mod')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
 
     def test_rename_detection(self):
@@ -720,7 +722,7 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"rename-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "git mv oldname.txt newname.txt"]], endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"rename-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "import os; os.rename('oldname.txt','newname.txt')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
 
     def test_git_failure_scope(self):
@@ -729,9 +731,9 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        # make git fail by removing .git temporarily via check? We'll use a wrapper that corrupts .git and then restores? Instead trigger git error via invalid git dir using env GIT_DIR?
-        # Our capture_repo will set git_error if git status fails; we can simulate by having validation that removes .git
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"gitfail-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "rm -rf .git"]], endpoint=ep, cred_path=cred)
+        # capture_repo sets git_error when git fails after validation removes .git;
+        # detect_scope must then fail closed with a scope violation
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"gitfail-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "import shutil; shutil.rmtree('.git')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
 
     def test_head_movement(self):
@@ -740,7 +742,8 @@ class TestMuseWorker(unittest.TestCase):
         prop = make_proposal([])
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"head-{uuid.uuid4().hex[:4]}", checks=[["bash", "-c", "git config user.email t@t.com; git config user.name t; echo x > new.txt; git add .; git commit -m c >/dev/null"]], endpoint=ep, cred_path=cred)
+        head_script = "import subprocess; open('new.txt','w').write('x'); subprocess.run(['git','add','.'],check=True,capture_output=True); subprocess.run(['git','commit','-m','c'],check=True,capture_output=True)"
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"head-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", head_script]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 21)
 
     def test_locking(self):
@@ -751,8 +754,9 @@ class TestMuseWorker(unittest.TestCase):
         cred = make_credential(self.scratch_root)
         srv2, ep2 = self.start({"delay": 2, "resp_body": wrap_response(prop)})
         marker = self.scratch_root / f"lock_marker_{uuid.uuid4().hex[:4]}.txt"
+        marker_script = f"import time; open(r'{marker}','w').write('acquired'); time.sleep(2)"
         def run1():
-            r = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"lock-{uuid.uuid4().hex[:4]}", endpoint=ep2, cred_path=cred, extra=["--wall-seconds", "5"], checks=[["bash","-c", f"echo acquired > {marker}; sleep 2"]])
+            r = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"lock-{uuid.uuid4().hex[:4]}", endpoint=ep2, cred_path=cred, extra=["--wall-seconds", "8"], checks=[["python3", "-c", marker_script]], allow_empty=True)
             return r
         t = threading.Thread(target=run1)
         t.start()
@@ -761,7 +765,7 @@ class TestMuseWorker(unittest.TestCase):
             if marker.exists():
                 break
             time.sleep(0.1)
-        res2 = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"lock2-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred, extra=["--wall-seconds", "5"])
+        res2 = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"lock2-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred, extra=["--wall-seconds", "5"], allow_empty=True)
         self.assertEqual(res2.returncode, 12)
         t.join(timeout=10)
 
@@ -769,8 +773,9 @@ class TestMuseWorker(unittest.TestCase):
         ws = make_workspace(self.scratch_root)
         contract = make_contract(self.scratch_root, "x")
         cid = f"malstate-{uuid.uuid4().hex[:4]}"
-        # create malformed state
-        bad_state_dir = self.scratch_root / "muse-worker-state" / cid
+        # create malformed state at the wrapper's canonical per-repo state path
+        repo_hash = hashlib.sha256(os.path.realpath(os.path.abspath(str(ws))).encode()).hexdigest()[:16]
+        bad_state_dir = self.scratch_root / "muse-worker-state" / f"{repo_hash}_{cid}"
         bad_state_dir.mkdir(parents=True, exist_ok=True)
         (bad_state_dir / "state.json").write_text("{ not json")
         os.chmod(bad_state_dir / "state.json", 0o600)
@@ -788,13 +793,13 @@ class TestMuseWorker(unittest.TestCase):
             srv, ep = self.start({"resp_body": wrap_response(prop)})
             cred = make_credential(self.scratch_root)
             c = make_contract(self.scratch_root, f"contract {i}")
-            res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="initial", endpoint=ep, cred_path=cred)
+            res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="initial", endpoint=ep, cred_path=cred, allow_empty=True)
             self.assertEqual(res.returncode, 0, f"i={i} {res.stdout+res.stderr}")
         # fourth initial should fail ceiling
         srv, ep = self.start({"resp_body": wrap_response(make_proposal([]))})
         cred = make_credential(self.scratch_root)
         c = make_contract(self.scratch_root, "contract final")
-        res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="initial", endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="initial", endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 14)
 
     def test_correction_ceiling(self):
@@ -805,12 +810,12 @@ class TestMuseWorker(unittest.TestCase):
             prop = make_proposal([])
             srv, ep = self.start({"resp_body": wrap_response(prop)})
             cred = make_credential(self.scratch_root)
-            res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="correction", endpoint=ep, cred_path=cred)
+            res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="correction", endpoint=ep, cred_path=cred, allow_empty=True)
             self.assertEqual(res.returncode, 0, res.stdout+res.stderr)
         c = make_contract(self.scratch_root, "corr final")
         srv, ep = self.start({"resp_body": wrap_response(make_proposal([]))})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="correction", endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, c, ["owned.txt"], self.scratch_root, cid, attempt_kind="correction", endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 14)
 
     def test_suppression(self):
@@ -834,7 +839,7 @@ class TestMuseWorker(unittest.TestCase):
         contract = make_contract(self.scratch_root, "x")
         srv, ep = self.start({"resp_body": wrap_response(make_proposal([]))})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"perm-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"perm-{uuid.uuid4().hex[:4]}", endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 0)
         ev = evidence_dir_from(res)
         self.assertEqual(oct(ev.stat().st_mode)[-3:], "700")
@@ -925,7 +930,7 @@ class TestMuseWorker(unittest.TestCase):
         srv, ep = self.start({"resp_body": wrap_response(prop)})
         cred = make_credential(self.scratch_root)
         # validation with large output but raw intact
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"bounded-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "for i in range(10000): print('hi')"]], endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, f"bounded-{uuid.uuid4().hex[:4]}", checks=[["python3", "-c", "for i in range(10000): print('hi')"]], endpoint=ep, cred_path=cred, allow_empty=True)
         self.assertEqual(res.returncode, 0)
         ev = evidence_dir_from(res)
         raw = (ev / "validation_0_stdout.log").read_bytes()
@@ -936,18 +941,15 @@ class TestMuseWorker(unittest.TestCase):
         ws = make_workspace(self.scratch_root)
         contract = make_contract(self.scratch_root, "x")
         cid = f"persist-{uuid.uuid4().hex[:4]}"
-        # make state dir a file to cause persistence failure
-        state_dir = self.scratch_root / "muse-worker-state" / cid
-        state_dir.mkdir(parents=True, exist_ok=True)
-        # create file at state.json path's parent? Actually we make state_dir a file
-        # Instead make the base path unwritable by chmod? But shared root chmod not allowed. We will make state.json directory conflict
-        # For this test, we mock by making state dir a file
-        # Remove dir and make file
-        shutil.rmtree(str(state_dir))
+        # occupy the wrapper's canonical per-repo state dir path with a regular
+        # file so state persistence must fail
+        repo_hash = hashlib.sha256(os.path.realpath(os.path.abspath(str(ws))).encode()).hexdigest()[:16]
+        state_dir = self.scratch_root / "muse-worker-state" / f"{repo_hash}_{cid}"
+        state_dir.parent.mkdir(parents=True, exist_ok=True)
         state_dir.write_text("file not dir")
         srv, ep = self.start({"resp_body": wrap_response(make_proposal([]))})
         cred = make_credential(self.scratch_root)
-        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, cid, endpoint=ep, cred_path=cred)
+        res = run_wrapper(ws, contract, ["owned.txt"], self.scratch_root, cid, endpoint=ep, cred_path=cred, allow_empty=True)
         # Should either succeed then fail persistence or preflight? The wrapper tries to mkdir parents, but if parent is file, mkdir fails -> persistence failure
         self.assertIn(res.returncode, (25, 10))
 

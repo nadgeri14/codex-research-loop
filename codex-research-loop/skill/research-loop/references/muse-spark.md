@@ -19,13 +19,12 @@ python scripts/muse_research_worker.py \
   --root REPO --contract CONTRACT \
   --owned-path REL --context-path REL \
   --check-json '["python","-m","py_compile","scripts/muse_research_worker.py"]' \
-  --scratch-root /lustre/nvwulf/scratch/anadgeri/codex-cache \
   --wall-seconds 1800 --http-seconds 60 \
   --max-input-bytes 204800 --max-output-tokens 8000 --max-response-bytes 2097152 \
   --attempt-kind initial --contract-id ID
 ```
 
-Do not use raw `muse exec`. Muse Spark remains the sole implementation model; the local CLI orchestration layer is bypassed. No model tools, no shell tools, no subagents. Finite budgets, canonical scratch under `/lustre/nvwulf/scratch/anadgeri/codex-cache` (no `/tmp`/`/dev/shm`/tmpfs/ramfs, no chmod of shared root), wrapper-owned `0700`/`0600` evidence and env dirs (`TMPDIR` etc. redirected). The model never chooses validation; it proposes only `replace`/`create`/`delete` edits within owned scope.
+Do not use raw `muse exec`. Muse Spark remains the sole implementation model; the local CLI orchestration layer is bypassed. No model tools, no shell tools, no subagents. Finite budgets, canonical scratch under the wrapper's machine-local scratch root default (`--scratch-root` may narrow it; never `/tmp`/`/dev/shm`/tmpfs/ramfs, no chmod of shared root), wrapper-owned `0700`/`0600` evidence and env dirs (`TMPDIR` etc. redirected). The model never chooses validation; it proposes only `replace`/`create`/`delete` edits within owned scope.
 
 ## Request/response and edits
 

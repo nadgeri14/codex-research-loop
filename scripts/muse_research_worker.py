@@ -1191,6 +1191,28 @@ def main(argv=None) -> int:
         eprint(f"preflight scratch: {exc}")
         return EXIT_PREFLIGHT
     try:
+        ev_base = Path(scratch) / "muse-worker-evidence" / sanitize(args.contract_id) / invocation
+        ev_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(ev_base, 0o700)
+    except Exception as exc:
+        eprint(f"preflight evidence: {exc}")
+        return EXIT_PREFLIGHT
+    def wbytes(name: str, b: bytes):
+        p = ev_base / name
+        p.write_bytes(b)
+        os.chmod(p, 0o600)
+        return p
+    def wtext(name: str, t: str):
+        p = ev_base / name
+        p.write_text(t, encoding="utf-8")
+        os.chmod(p, 0o600)
+        return p
+    def wjson(name: str, obj: Any):
+        p = ev_base / name
+        p.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+        os.chmod(p, 0o600)
+        return p
+    try:
         root = os.path.realpath(os.path.abspath(args.root))
         if not os.path.isdir(root):
             raise ValueError(f"root not directory {root}")
@@ -1225,29 +1247,12 @@ def main(argv=None) -> int:
                 raise ValueError(f"context-path invalid {c!r}")
     except Exception as exc:
         eprint(f"preflight path: {exc}")
+        try:
+            wjson("summary.json", {"schema_version": SCHEMA_VERSION, "invocation": invocation, "contract_id": args.contract_id, "classification": CLASS_FOR[EXIT_PREFLIGHT], "exit_code": EXIT_PREFLIGHT, "evidence_dir": str(ev_base), "error": str(exc)[:1000]})
+        except Exception:
+            pass
+        eprint(f"evidence: {ev_base}")
         return EXIT_PREFLIGHT
-    try:
-        ev_base = Path(scratch) / "muse-worker-evidence" / sanitize(args.contract_id) / invocation
-        ev_base.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(ev_base, 0o700)
-    except Exception as exc:
-        eprint(f"preflight evidence: {exc}")
-        return EXIT_PREFLIGHT
-    def wbytes(name: str, b: bytes):
-        p = ev_base / name
-        p.write_bytes(b)
-        os.chmod(p, 0o600)
-        return p
-    def wtext(name: str, t: str):
-        p = ev_base / name
-        p.write_text(t, encoding="utf-8")
-        os.chmod(p, 0o600)
-        return p
-    def wjson(name: str, obj: Any):
-        p = ev_base / name
-        p.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-        os.chmod(p, 0o600)
-        return p
     sanitized_argv = sanitize_argv(sys.argv)
     budgets = {
         "wall_seconds": args.wall_seconds,
@@ -1597,7 +1602,7 @@ def main(argv=None) -> int:
             eprint("request body exceeds max-input-bytes")
             return EXIT_PREFLIGHT
         wtext("request.sha256", sha256_bytes(req_bytes) + "\n")
-        sanitized = {"model": MODEL_ID, "reasoning": {"effort": EFF}, "stream": False, "max_output_tokens": args.max_output_tokens, "input_hash": sha256_text(full_prompt), "input_bytes": len(full_prompt.encode())} if False else {"model": MODEL_ID, "reasoning": {"effort": EFFORT}, "stream": False, "max_output_tokens": args.max_output_tokens, "input_hash": sha256_text(full_prompt), "input_bytes": len(full_prompt.encode())}
+        sanitized = {"model": MODEL_ID, "reasoning": {"effort": EFFORT}, "stream": False, "max_output_tokens": args.max_output_tokens, "input_hash": sha256_text(full_prompt), "input_bytes": len(full_prompt.encode())}
         wjson("request_sanitized.json", sanitized)
         raw_resp_path = ev_base / "raw_response.bin"
         raw_resp_path.write_bytes(b"")
@@ -2247,7 +2252,6 @@ def main(argv=None) -> int:
                     pass
                 out_f = open(out_path, "ab")
                 err_f = open(err_path, "ab")
-                start_check = time.monotonic()
                 stdout_eof = False
                 stderr_eof = False
                 while True:
@@ -2380,10 +2384,6 @@ def main(argv=None) -> int:
                             aggregate_bytes += len(to_write)
                             if len(data) > allowed:
                                 stderr_trunc = True
-                    # wall timeout per-check
-                    if time.monotonic() - start_check > remaining:
-                        # remaining is wall_deadline - start, but we already enforce wall_deadline globally
-                        pass
                     if time.monotonic() > wall_deadline:
                         timeout_flag = True
                         break
