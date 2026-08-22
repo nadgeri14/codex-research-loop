@@ -75,10 +75,31 @@ class CodexResearchLoopInstallerTests(unittest.TestCase):
             {
                 "cluster-checker.toml",
                 "cluster-monitor.toml",
+                "muse-implementor.toml",
                 "research-code-reviewer.toml",
                 "research-lead.toml",
             },
         )
+
+        muse_profile = (self.codex_home / "agents" / "muse-implementor.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('name = "muse_implementor"', muse_profile)
+        self.assertIn('model = "meta/muse-spark-1.2-contributor"', muse_profile)
+        self.assertIn('model_reasoning_effort = "xhigh"', muse_profile)
+        self.assertIn('sandbox_mode = "workspace-write"', muse_profile)
+
+        research_lead = (self.codex_home / "agents" / "research-lead.toml").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (
+            self.codex_home / "agents" / "research-code-reviewer.toml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('model = "gpt-5.6-sol"', research_lead)
+        self.assertIn('model_reasoning_effort = "xhigh"', research_lead)
+        self.assertIn('model = "gpt-5.6-sol"', reviewer)
+        self.assertIn('model_reasoning_effort = "high"', reviewer)
+        self.assertIn('sandbox_mode = "read-only"', reviewer)
 
         second = installer.install_targets(
             self.targets(), codex_home=self.codex_home, dry_run=False
@@ -278,6 +299,22 @@ class CodexResearchLoopInstallerTests(unittest.TestCase):
         )
         self.assertNotIn("/" + "lustre" + "/" + "nvwulf", rendered)
         self.assertNotIn("ana" + "dgeri", rendered)
+
+    def test_default_lane_is_native_muse_subagent_not_direct_api(self) -> None:
+        package_root = installer.locate_package_root(self.repo_root)
+        policy = (package_root / "AGENTS.block.md").read_text(encoding="utf-8")
+        skill = (
+            package_root / "skill" / "research-loop" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        readme = (package_root / "README.md").read_text(encoding="utf-8")
+
+        for document in (policy, skill, readme):
+            self.assertIn("muse_implementor", document)
+            self.assertIn("meta/muse-spark-1.2-contributor", document)
+
+        self.assertNotIn("Phase 1 direct API", policy)
+        self.assertNotIn("via `scripts/muse_research_worker.py`", skill)
+        self.assertNotIn("sole operational path", readme)
 
 
 if __name__ == "__main__":

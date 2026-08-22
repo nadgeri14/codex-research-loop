@@ -1,0 +1,100 @@
+diff --git a/src/api-forwarder.mjs b/src/api-forwarder.mjs
+index f635f53..f78fbad 100644
+--- a/src/api-forwarder.mjs
++++ b/src/api-forwarder.mjs
+@@ -515,0 +516,23 @@ function stripSearchContentTypes(tools) {
++// Codex uses `agent_message` as an internal collaboration envelope. Meta's
++// Responses endpoint only accepts the public Responses input-item variants and
++// rejects that envelope before the model runs (for example, "input[4] did not
++// match any supported type"). The visible collaboration header already names
++// the sender, recipient, and message type, so expose its content as an ordinary
++// user message and omit Codex-only metadata that strict schema validation would
++// reject. Keep this repair Meta-scoped until another Responses provider proves
++// it needs the same compatibility conversion.
++function normalizeMetaAgentMessages(input) {
++  if (!Array.isArray(input)) return input;
++  let changed = false;
++  const normalized = input.map((item) => {
++    if (item?.type !== "agent_message" || !Array.isArray(item.content)) return item;
++    changed = true;
++    return {
++      type: "message",
++      role: "user",
++      content: item.content,
++    };
++  });
++  return changed ? normalized : input;
++}
++
+@@ -596,0 +620,3 @@ function normalizeBody(buffer, contentType, route) {
++  if (provider.id === "meta") {
++    payload.input = normalizeMetaAgentMessages(payload.input);
++  }
+diff --git a/test/routing.test.mjs b/test/routing.test.mjs
+index 304da67..c247eaf 100644
+--- a/test/routing.test.mjs
++++ b/test/routing.test.mjs
+@@ -4177,0 +4178,63 @@ test("API forwarder drops the search_content_types Meta refuses, and only for Me
++test("API forwarder converts Codex agent_message input for Meta Responses", async () => {
++  const upstreamRequests = [];
++  const upstream = await mockServer(async (request, response) => {
++    upstreamRequests.push({ url: request.url, body: await bodyJson(request) });
++    json(response, 200, {
++      id: "resp_test",
++      object: "response",
++      status: "completed",
++      model: "muse-spark-1.2-contributor",
++      output: [],
++    });
++  });
++  const forwarderPort = await openPort();
++  const forwarder = run("api-forwarder.mjs", {
++    CODEX_ROUTER_API_PORT: String(forwarderPort),
++    META_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
++    META_API_KEY: "TEST_META_API_KEY",
++    CODEX_ROUTER_QUIET: "1",
++  });
++
++  try {
++    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
++      Authorization: `Bearer ${INTERNAL_KEY}`,
++    });
++    const content = [
++      {
++        type: "input_text",
++        text: "Message Type: NEW_TASK\nSender: /root\nPayload:\nImplement the smoke task.",
++      },
++    ];
++    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${INTERNAL_KEY}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        model: "meta-muse-spark-1-2-contributor",
++        input: [
++          { type: "message", role: "developer", content: "Implement only." },
++          {
++            type: "agent_message",
++            id: "amsg_internal",
++            author: "/root",
++            recipient: "/root/muse",
++            content,
++          },
++        ],
++      }),
++    });
++
++    assert.equal(response.status, 200, forwarder.testErrors());
++    assert.equal(upstreamRequests.length, 1);
++    assert.deepEqual(upstreamRequests[0].body.input, [
++      { type: "message", role: "developer", content: "Implement only." },
++      { type: "message", role: "user", content },
++    ]);
++  } finally {
++    await stopChild(forwarder);
++    await closeServer(upstream.server);
++  }
++});
++

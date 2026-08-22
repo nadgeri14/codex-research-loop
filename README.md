@@ -1,35 +1,74 @@
-# codex-research-loop
+# Portable Codex research loop — native Muse Spark subagent
 
-A token-efficient, evidence-preserving research loop for Codex: GPT-5.6-Sol at
-`xhigh` owns research reasoning, planning, and implementation contracts;
-GPT-5.6-Sol at `high` (read-only) reviews every diff; Meta Muse Spark
-(`muse-spark-1.2-contributor` at `xhigh`) is the sole implementation worker;
-deterministic tools and GPT-5.6-Luna at `low` handle cluster observation and
-long waits.
+This package installs a token-efficient research workflow in which GPT-5.6-Sol
+at `xhigh` remains the main scientific brain and contract author. The native
+Codex custom agent `muse_implementor`, pinned to
+`meta/muse-spark-1.2-contributor` at `xhigh`, performs bounded implementation.
+GPT-5.6-Sol at `high` reviews every implementation diff read-only. Deterministic
+tools and GPT-5.6-Luna at `low` own operational observation.
 
-Muse Spark is reached through two reviewed lanes — never raw `muse exec`:
+```text
+Sol-xhigh research lead
+        |
+        v
+bounded contract + exact ownership
+        |
+        v
+native muse_implementor (Muse Spark xhigh)
+        |
+        v
+Sol-high read-only review
+        |
+        v
+Sol-xhigh launch / scientific decision
+        |
+        v
+deterministic cluster-manager watch
+        +-- ordinary progress: sleep silently
+        +-- ambiguous material event: bounded Luna triage
+        `-- scientific/material event: wake Sol-xhigh
+```
 
-- **Direct API worker** (default): `scripts/muse_research_worker.py` — one-shot,
-  fail-closed `POST https://api.meta.ai/v1/responses`, no tools, transactional
-  owned-path edits, caller-declared validations, git-baseline scope
-  verification, private evidence under scratch.
-- **Gated CLI lane** (escalation only): `scripts/muse_cli_worker.py` — headless
-  `muse exec --yolo --user-input-auto-resolve` inside a disposable git worktree
-  under scratch, hard wall deadline, main-repo contamination check on every
-  path, patch extracted for review, separate scope-verified `--apply-patch`
-  step.
+The main thread never changes to Muse. Muse receives no inherited research
+conversation, only a compact implementation contract, exact owned/context
+paths, and approved validation commands. It cannot make scientific decisions,
+operate cluster jobs, or spawn more agents. One write-capable implementor runs
+at a time, and the Sol-high reviewer gates consequential launches.
 
-## Layout
+The monitor persists cursors and compact state atomically, deduplicates events,
+applies deterministic invariants, and never returns merely because time passed.
+A long job with only expected progress produces no frontier continuation.
 
-- `scripts/` — the two Muse workers, `research_manager.py`,
-  `cluster_manager.py`, and the installer
-- `tests/` — stdlib-only test suites for all of the above (no model calls;
-  fake server / fake muse binary)
-- `codex-research-loop/` — the installable package: agent TOMLs, the
-  user-wide `research-loop` skill, the managed `AGENTS.block.md`, and the
-  package [README](codex-research-loop/README.md) with full install docs
-- `review_contracts/` — the implementation-correction contracts this code was
-  reviewed against
+## Requirements
+
+- Python 3.10+; the managers use only the standard library.
+- Slurm for scheduler-specific `cluster-manager` operations.
+- A current Codex release with custom subagents enabled.
+- The local model router running with the Meta provider authenticated and
+  `meta/muse-spark-1.2-contributor` present in its catalog.
+
+The package does not install provider credentials, change router credentials,
+or rewrite the user's default main model.
+
+The repository intentionally contains no API keys, access tokens, router
+capability URLs, user paths, model transcripts, research evidence, or cluster
+logs.
+
+## Included
+
+- Five native Codex custom-agent profiles: Sol-xhigh research lead, Muse-xhigh
+  implementor, Sol-high read-only reviewer, Luna-low monitor, and Luna-low
+  checker.
+- The token-efficient `research-loop` skill and concise managed `AGENTS.md`
+  policy block.
+- Restart-safe `research-manager` and deterministic, incremental
+  `cluster-manager` monitoring CLIs.
+- An idempotent installer that preserves unrelated user configuration and
+  creates recoverable backups before replacing an existing target.
+- Unit and integration tests for installation, durable state, incremental log
+  cursors, event routing, deduplication, and zero-LLM unchanged waits.
+- The optional codex-router Meta `agent_message` compatibility patch used by
+  the verified native Muse smoke test.
 
 ## Install
 
@@ -40,14 +79,78 @@ python3 scripts/install_codex_research_loop.py --dry-run
 python3 scripts/install_codex_research_loop.py
 ```
 
-Python 3.10+, standard library only. On a machine other than the original
-cluster, set `MUSE_WORKER_SCRATCH_ROOT` to a local (non-tmpfs, non-`/tmp`)
-scratch directory before running the workers.
+Ensure `$HOME/.local/bin` is on `PATH`, then fully restart Codex so it reloads
+the custom-agent profiles and model catalog. The installer is idempotent and
+backs up every changed existing target before replacing it.
+
+It installs:
+
+- `research-manager` and `cluster-manager` under `$HOME/.local/bin`;
+- the user-wide `research-loop` skill under `$HOME/.agents/skills`;
+- `research_lead` (Sol-xhigh), `muse_implementor` (Muse-xhigh),
+  `research_code_reviewer` (Sol-high read-only), and the Luna-low operational
+  agents under `${CODEX_HOME:-$HOME/.codex}/agents`;
+- a concise marked policy block in `${CODEX_HOME:-$HOME/.codex}/AGENTS.md`,
+  preserving all content outside that block.
+
+Use `--codex-home`, `--skills-dir`, or `--bin-dir` to override destinations.
+Use `--json` for machine-readable output.
+
+For a project-scoped installation instead of a user-wide one, copy the agent
+profiles into the target repository's `.codex/agents/` directory and append
+`AGENTS.block.md` to that repository's `AGENTS.md`. See the official
+[Codex subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+for custom-agent precedence and required fields.
+
+## Meta router compatibility
+
+The native Muse profile depends on codex-router exposing
+`meta/muse-spark-1.2-contributor`. Router `0.4.0-beta.4` forwarded Codex's
+internal `agent_message` item to Meta unchanged, which Meta rejected with
+`input[n] did not match any supported type`. The tested, Meta-scoped repair is
+stored at `patches/codex-router-meta-agent-message.patch`.
+
+Apply it only when your installed router still has that bug:
+
+```bash
+git -C /path/to/codex-router apply --check \
+  "$PWD/patches/codex-router-meta-agent-message.patch"
+git -C /path/to/codex-router apply \
+  "$PWD/patches/codex-router-meta-agent-message.patch"
+```
+
+Run the router checks and restart its service after applying it. Do not apply
+the patch if `git apply --check` reports that the fix is already present or the
+target version has diverged; inspect the newer router instead.
+
+## Review boundary
+
+- Sol-xhigh owns hypotheses, experiment design, contracts, scientific
+  interpretation, and go/no-go.
+- Muse-xhigh implements only the execution-ready contract within declared
+  ownership and returns bounded validation evidence.
+- Sol-high reviews the actual diff and checks for correctness, regressions,
+  edge cases, and missing tests. It never edits or makes scientific decisions.
+- Deterministic monitors wait; Luna-low classifies only bounded ambiguous
+  operational events.
+
+If the native Muse profile or routed model is unavailable, the workflow stops
+without substituting another model or execution lane.
 
 ## Verify
 
 ```bash
-python3 -m unittest tests.test_muse_research_worker tests.test_muse_cli_worker \
-  tests.test_research_manager tests.test_cluster_manager \
-  tests.test_install_codex_research_loop tests.test_event_driven_monitor
+python -m py_compile scripts/install_codex_research_loop.py tests/test_install_codex_research_loop.py
+python -m unittest tests.test_install_codex_research_loop
+python scripts/install_codex_research_loop.py --dry-run --json
+git diff --check
 ```
+
+Run the bounded end-to-end procedure in [docs/NATIVE_MUSE_SMOKE.md](docs/NATIVE_MUSE_SMOKE.md)
+after configuring the Meta provider. The smoke writes only one exact 20-byte
+artifact under a caller-selected scratch directory.
+
+Research state is stored under each repository's `.research/` directory.
+Bounded handoffs are indexes only: full structured state remains available via
+`research-manager inspect`, while raw logs, metrics, checkpoints, plots, and
+artifacts remain untouched.
